@@ -1,0 +1,26 @@
+# LangChain + Ollama
+langchain
+langchain-community
+openai  # Needed for some LangChain internals
+ollama
+
+# Web Search
+duckduckgo-search
+
+# Web scraping and HTML parsing
+requests
+beautifulsoup4
+playwright
+
+# PDF parsing
+PyPDF2
+
+# For structured agent tools / CLI
+tqdm
+python-dotenv
+
+# Optional: persistent memory / vector store (you can expand later)
+faiss-cpu
+
+# Required for Playwright installation (only needed once)
+# You should also run: playwright install

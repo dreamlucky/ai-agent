@@ -1,0 +1,17 @@
+version: "3.9"
+
+services:
+  ai-agent:
+    build: .
+    container_name: ai-agent
+    working_dir: /app
+    volumes:
+      - /mnt/cache/ai/data:/app/data
+      - /mnt/cache/ai/tools:/app/tools
+      - /mnt/cache/ai/prompts:/app/prompts
+    env_file:
+      - .env
+    ports:
+      - "8008:8008"
+    restart: unless-stopped
+
