@@ -25,6 +25,14 @@ def generate():
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
+@app.route("/api/tags", methods=["GET"])
+def list_models():
+    try:
+        response = requests.get(f"{OLLAMA_URL}/api/tags")
+        return jsonify(response.json()), response.status_code
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
 @app.route("/")
 def health():
     return "AI-Agent proxy up!", 200
