@@ -114,9 +114,14 @@ def chat():
 def list_models():
     try:
         response = requests.get(f"{OLLAMA_URL}/api/tags")
+        print("[DEBUG] Ollama /api/tags response text:", response.text)
         return jsonify(response.json()), response.status_code
     except Exception as e:
+        import traceback
+        traceback.print_exc()
+        print("[ERROR] /api/tags failed:", str(e))
         return jsonify({"error": str(e)}), 500
+
 
 @app.route("/api/version", methods=["GET"])
 def version():
