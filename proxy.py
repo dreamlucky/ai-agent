@@ -80,8 +80,10 @@ def chat():
         upstream = requests.post(f"{OLLAMA_URL}/api/generate", json=ollama_payload, stream=True)
 
         def generate_stream():
-            # Initial role (required by Open WebUI)
-            yield 'data: {"choices": [{"delta": {"role": "assistant"}}]}\n\n'
+            # Initial role announcement
+            initial = {"choices": [{"delta": {"role": "assistant"}}]}
+            print("[STREAM OUT] Initial:", initial)
+            yield f'data: {json.dumps(initial)}\n\n'
 
             for line in upstream.iter_lines():
                 if line:
@@ -89,12 +91,16 @@ def chat():
                         chunk = json.loads(line.decode("utf-8"))
                         content = chunk.get("response", "")
                         if content:
-                            yield f'data: {json.dumps({"choices": [{"delta": {"content": content}}]})}\n\n'
+                            msg = {"choices": [{"delta": {"content": content}}]}
+                            print("[STREAM OUT] Chunk:", msg)
+                            yield f'data: {json.dumps(msg)}\n\n'
                     except Exception as e:
                         print("[STREAM ERROR]", e)
 
-            # Finish sequence
-            yield 'data: {"choices": [{"delta": {},"finish_reason": "stop"}]}\n\n'
+            # Finish signal
+            final = {"choices": [{"delta": {}, "finish_reason": "stop"}]}
+            print("[STREAM OUT] Final:", final)
+            yield f'data: {json.dumps(final)}\n\n'
 
         return Response(stream_with_context(generate_stream()), mimetype='text/event-stream')
 
@@ -102,6 +108,7 @@ def chat():
         import traceback
         traceback.print_exc()
         return jsonify({"error": str(e)}), 500
+
 
 @app.route("/api/tags", methods=["GET"])
 def list_models():
