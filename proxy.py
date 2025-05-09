@@ -35,8 +35,37 @@ def list_models():
 
 @app.route("/api/chat", methods=["POST"])
 def chat():
-    # Forward same data as /generate
-    return generate()
+    data = request.get_json()
+    print("[DEBUG] Incoming OpenAI-style chat data:", data)
+
+    # Extract prompt from message list (OpenAI format)
+    messages = data.get("messages", [])
+    prompt = "\n".join([msg.get("content", "") for msg in messages])
+
+    ollama_payload = {
+        "model": data.get("model", "qwen3:30b-a3b"),
+        "prompt": prompt
+    }
+
+    try:
+        response = requests.post(f"{OLLAMA_URL}/api/generate", json=ollama_payload)
+        result = response.json()
+
+        return jsonify({
+            "id": "chatcmpl-local",
+            "object": "chat.completion",
+            "choices": [{
+                "message": {
+                    "role": "assistant",
+                    "content": result.get("response", "")
+                }
+            }],
+            "model": ollama_payload["model"]
+        }), 200
+
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
 
 
 @app.route("/")
