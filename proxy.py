@@ -1,5 +1,5 @@
 from flask import Flask, request, jsonify
-from tools.search import run_duckduckgo
+from tools import search
 import requests
 import os
 
