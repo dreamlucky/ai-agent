@@ -6,23 +6,22 @@ services:
     container_name: ai-agent
     working_dir: /app
     volumes:
-      - /mnt/cache/ai/data:/app/data
-      - /mnt/cache/ai/tools:/app/tools
-      - /mnt/cache/ai/prompts:/app/prompts
-    env_file:
-      - .env
+      - /mnt/ai/data:/app/data
+      - /mnt/ai/tools:/app/tools
+      - /mnt/ai/prompts:/app/prompts
     ports:
-      - "8008:8008"
-      - "11435:5000"  # Flask proxy exposed here
+      - "11435:5000"  # Flask proxy
+    environment:
+      - OLLAMA_BACKEND=http://192.168.1.8:11434
     restart: unless-stopped
 
   openwebui:
-      image: ghcr.io/open-webui/open-webui:main
-      container_name: openwebui
-      ports:
-        - "8080:8080"
-      environment:
-        - OLLAMA_API_BASE_URL=http://ai-agent:5000
-      volumes:
-        - /mnt/cache/ai/openwebui:/app/backend/data
-      restart: unless-stopped
+    image: ghcr.io/open-webui/open-webui:main
+    container_name: openwebui
+    ports:
+      - "8080:8080"
+    environment:
+      - OLLAMA_API_BASE_URL=http://ai-agent:5000
+    volumes:
+      - /mnt/ai/openwebui:/app/backend/data
+    restart: unless-stopped
