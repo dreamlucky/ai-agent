@@ -1,8 +1,3 @@
-import sys
-if '/' not in sys.path:
-    sys.path.append('/')
-
-
 from flask import Flask, request, jsonify
 from tools.search import run_duckduckgo
 import requests
