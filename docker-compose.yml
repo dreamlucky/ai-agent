@@ -9,7 +9,7 @@ services:
       - /mnt/ai/tools:/tools
       - /mnt/ai/prompts:/prompts
     environment:
-      - OLLAMA_BACKEND=http://192.168.1.8:11435
+      - OLLAMA_BACKEND=http://192.168.1.8:11434
     restart: unless-stopped
 
   openwebui:
