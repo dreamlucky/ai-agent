@@ -1,4 +1,5 @@
 from flask import Flask, request, jsonify
+from flask import Response, stream_with_context
 from tools import search
 import requests
 import os
@@ -10,19 +11,45 @@ OLLAMA_URL = os.getenv("OLLAMA_BACKEND", "http://192.168.1.8:11434")
 @app.route("/api/generate", methods=["POST"])
 def generate():
     data = request.get_json()
-    user_prompt = data.get("prompt", "")
+    print("[DEBUG] Direct generate data:", data)
 
-    # === AGENT LOGIC: Intercept 'search' intent ===
+    user_prompt = data.get("prompt", "")
+    model = data.get("model", "qwen3:30b-a3b")
+    use_stream = data.get("stream", True)
+
+    # === AGENT LOGIC ===
     if "search" in user_prompt.lower() or "look up" in user_prompt.lower():
         query = user_prompt.lower().replace("search", "").replace("look up", "").strip()
         results = run_duckduckgo(query)
         return jsonify({"response": results})
 
-    # === Otherwise, forward to Ollama ===
+    # === Streamed response ===
+    ollama_payload = {
+        "model": model,
+        "prompt": user_prompt,
+        "stream": use_stream
+    }
+
     try:
-        response = requests.post(f"{OLLAMA_URL}/api/generate", json=data)
-        return jsonify(response.json()), response.status_code
+        upstream = requests.post(f"{OLLAMA_URL}/api/generate", json=ollama_payload, stream=use_stream)
+
+        if not use_stream:
+            return jsonify(upstream.json()), upstream.status_code
+
+        def stream_response():
+            for line in upstream.iter_lines():
+                if line:
+                    try:
+                        chunk = json.loads(line.decode("utf-8"))
+                        yield f'data: {json.dumps(chunk)}\n\n'
+                    except Exception as e:
+                        print("[STREAM ERROR]", e)
+
+        return Response(stream_with_context(stream_response()), mimetype='text/event-stream')
+
     except Exception as e:
+        import traceback
+        traceback.print_exc()
         return jsonify({"error": str(e)}), 500
 
 @app.route("/api/tags", methods=["GET"])
@@ -35,33 +62,32 @@ def list_models():
 
 @app.route("/api/chat", methods=["POST"])
 def chat():
+    data = request.get_json()
+    print("[DEBUG] OpenAI-style chat data:", data)
+
+    messages = data.get("messages", [])
+    prompt = "\n".join([msg.get("content", "") for msg in messages])
+
+    ollama_payload = {
+        "model": data.get("model", "qwen3:30b-a3b"),
+        "prompt": prompt,
+        "stream": True  # 🔥 key change
+    }
+
     try:
-        data = request.get_json()
-        print("[DEBUG] OpenAI chat data:", data)
+        upstream = requests.post(f"{OLLAMA_URL}/api/generate", json=ollama_payload, stream=True)
 
-        # Extract message content
-        messages = data.get("messages", [])
-        prompt = "\n".join([msg.get("content", "") for msg in messages])
+        def generate_stream():
+            for line in upstream.iter_lines():
+                if line:
+                    try:
+                        chunk = json.loads(line.decode("utf-8"))
+                        content = chunk.get("response", "")
+                        yield f'data: {json.dumps({"choices": [{"delta": {"content": content}}]})}\n\n'
+                    except Exception as e:
+                        print("[STREAM ERROR]", e)
 
-        ollama_payload = {
-            "model": data.get("model", "qwen3:30b-a3b"),
-            "prompt": prompt
-        }
-
-        response = requests.post(f"{OLLAMA_URL}/api/generate", json=ollama_payload)
-        result = response.json()
-
-        return jsonify({
-            "id": "chatcmpl-local",
-            "object": "chat.completion",
-            "choices": [{
-                "message": {
-                    "role": "assistant",
-                    "content": result.get("response", "")
-                }
-            }],
-            "model": ollama_payload["model"]
-        })
+        return Response(stream_with_context(generate_stream()), mimetype='text/event-stream')
 
     except Exception as e:
         import traceback
