@@ -80,10 +80,10 @@ def chat():
         upstream = requests.post(f"{OLLAMA_URL}/api/generate", json=ollama_payload, stream=True)
 
         def generate_stream():
-            # Initial role announcement
+            # Send initial assistant role declaration
             initial = {"choices": [{"delta": {"role": "assistant"}}]}
-            print("[STREAM OUT] Initial:", initial)
             yield f'data: {json.dumps(initial)}\n\n'
+            print("[STREAM OUT] Initial:", initial)
 
             for line in upstream.iter_lines():
                 if line:
@@ -91,16 +91,17 @@ def chat():
                         chunk = json.loads(line.decode("utf-8"))
                         content = chunk.get("response", "")
                         if content:
-                            msg = {"choices": [{"delta": {"content": content}}]}
-                            print("[STREAM OUT] Chunk:", msg)
-                            yield f'data: {json.dumps(msg)}\n\n'
+                            payload = {"choices": [{"delta": {"content": content}}]}
+                            print("[STREAM OUT] Chunk:", payload)
+                            yield f'data: {json.dumps(payload)}\n\n'
                     except Exception as e:
                         print("[STREAM ERROR]", e)
 
-            # Finish signal
-            final = {"choices": [{"delta": {}, "finish_reason": "stop"}]}
+            # Signal end of stream
+            final = {"choices": [{"delta": {} }], "finish_reason": "stop"}
             print("[STREAM OUT] Final:", final)
             yield f'data: {json.dumps(final)}\n\n'
+            yield 'data: [DONE]\n\n'
 
         return Response(stream_with_context(generate_stream()), mimetype='text/event-stream')
 
