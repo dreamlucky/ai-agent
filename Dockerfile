@@ -17,4 +17,4 @@ RUN pip install --no-cache-dir -r requirements.txt
 COPY . .
 
 # Run the main script by default
-CMD ["python", "main.py"]
+CMD ["python", "main.py", "app/proxy.py"]

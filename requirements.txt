@@ -22,5 +22,8 @@ python-dotenv
 # Optional: persistent memory / vector store (you can expand later)
 faiss-cpu
 
+#proxy
+flask
+
 # Required for Playwright installation (only needed once)
 # You should also run: playwright install

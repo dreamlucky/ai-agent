@@ -13,5 +13,16 @@ services:
       - .env
     ports:
       - "8008:8008"
+      - "11435:5000"  # Flask proxy exposed here
     restart: unless-stopped
 
+  openwebui:
+      image: ghcr.io/open-webui/open-webui:main
+      container_name: openwebui
+      ports:
+        - "8080:8080"
+      environment:
+        - OLLAMA_API_BASE_URL=http://ai-agent:5000
+      volumes:
+        - /mnt/cache/ai/openwebui:/app/backend/data
+      restart: unless-stopped
