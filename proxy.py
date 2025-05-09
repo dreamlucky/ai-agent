@@ -67,10 +67,12 @@ def chat():
     print("[DEBUG] OpenAI-style chat data:", data)
 
     messages = data.get("messages", [])
+    model = data.get("model", "qwen3:30b-a3b")
+
     prompt = "\n".join([msg.get("content", "") for msg in messages])
 
     ollama_payload = {
-        "model": data.get("model", "qwen3:30b-a3b"),
+        "model": model,
         "prompt": prompt,
         "stream": True
     }
@@ -84,9 +86,12 @@ def chat():
                     try:
                         chunk = json.loads(line.decode("utf-8"))
                         content = chunk.get("response", "")
-                        yield f'data: {json.dumps({"choices": [{"delta": {"content": content}}]})}\n\n'
+                        yield f'data: {json.dumps({"choices": [{"delta": {"content": content}}, {"finish_reason": None}]})}\n\n'
                     except Exception as e:
                         print("[STREAM ERROR]", e)
+
+            # Final finish marker
+            yield 'data: {"choices": [{"delta": {},"finish_reason": "stop"}]}\n\n'
 
         return Response(stream_with_context(generate_stream()), mimetype='text/event-stream')
 
