@@ -1,6 +1,5 @@
-from flask import Flask, request, jsonify
-from flask import Response, stream_with_context
-from tools import search
+from flask import Flask, request, jsonify, Response, stream_with_context
+from tools.search import run_duckduckgo
 import requests
 import os
 import json
@@ -18,11 +17,19 @@ def generate():
     model = data.get("model", "qwen3:30b-a3b")
     use_stream = data.get("stream", True)
 
-    # === AGENT LOGIC ===
+    # === AGENT TOOL LOGIC: Intercept search ===
     if "search" in user_prompt.lower() or "look up" in user_prompt.lower():
         query = user_prompt.lower().replace("search", "").replace("look up", "").strip()
         results = run_duckduckgo(query)
-        return jsonify({"response": results})
+
+        if use_stream:
+            def stream_one_result():
+                yield f'data: {json.dumps({"response": results})}\n\n'
+                yield 'data: [DONE]\n\n'
+
+            return Response(stream_with_context(stream_one_result()), mimetype='text/event-stream')
+        else:
+            return jsonify({"response": results})
 
     # === Streamed response ===
     ollama_payload = {
@@ -53,13 +60,6 @@ def generate():
         traceback.print_exc()
         return jsonify({"error": str(e)}), 500
 
-@app.route("/api/tags", methods=["GET"])
-def list_models():
-    try:
-        response = requests.get(f"{OLLAMA_URL}/api/tags")
-        return jsonify(response.json()), response.status_code
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
 
 @app.route("/api/chat", methods=["POST"])
 def chat():
@@ -72,7 +72,7 @@ def chat():
     ollama_payload = {
         "model": data.get("model", "qwen3:30b-a3b"),
         "prompt": prompt,
-        "stream": True  # 🔥 key change
+        "stream": True
     }
 
     try:
@@ -96,10 +96,19 @@ def chat():
         return jsonify({"error": str(e)}), 500
 
 
+@app.route("/api/tags", methods=["GET"])
+def list_models():
+    try:
+        response = requests.get(f"{OLLAMA_URL}/api/tags")
+        return jsonify(response.json()), response.status_code
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
 
 @app.route("/")
 def health():
     return "AI-Agent proxy up!", 200
+
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=5000)
