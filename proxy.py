@@ -111,6 +111,9 @@ def list_models():
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
+@app.route("/api/version", methods=["GET"])
+def version():
+    return jsonify({"version": "0.1.0"}), 200
 
 @app.route("/")
 def health():
