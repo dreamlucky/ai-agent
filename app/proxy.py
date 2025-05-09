@@ -1,3 +1,6 @@
+import sys
+print("PYTHONPATH:", sys.path)
+
 from flask import Flask, request, jsonify
 from tools.search import run_duckduckgo
 import requests
