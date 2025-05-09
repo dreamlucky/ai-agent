@@ -33,6 +33,12 @@ def list_models():
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
+@app.route("/api/chat", methods=["POST"])
+def chat():
+    # Forward same data as /generate
+    return generate()
+
+
 @app.route("/")
 def health():
     return "AI-Agent proxy up!", 200

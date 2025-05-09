@@ -12,3 +12,4 @@ def run_duckduckgo(query):
             return f"DuckDuckGo returned error code {resp.status_code}"
     except Exception as e:
         return f"Search failed: {str(e)}"
+
