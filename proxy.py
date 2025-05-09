@@ -35,19 +35,19 @@ def list_models():
 
 @app.route("/api/chat", methods=["POST"])
 def chat():
-    data = request.get_json()
-    print("[DEBUG] Incoming OpenAI-style chat data:", data)
-
-    # Extract prompt from message list (OpenAI format)
-    messages = data.get("messages", [])
-    prompt = "\n".join([msg.get("content", "") for msg in messages])
-
-    ollama_payload = {
-        "model": data.get("model", "qwen3:30b-a3b"),
-        "prompt": prompt
-    }
-
     try:
+        data = request.get_json()
+        print("[DEBUG] OpenAI chat data:", data)
+
+        # Extract message content
+        messages = data.get("messages", [])
+        prompt = "\n".join([msg.get("content", "") for msg in messages])
+
+        ollama_payload = {
+            "model": data.get("model", "qwen3:30b-a3b"),
+            "prompt": prompt
+        }
+
         response = requests.post(f"{OLLAMA_URL}/api/generate", json=ollama_payload)
         result = response.json()
 
@@ -61,9 +61,11 @@ def chat():
                 }
             }],
             "model": ollama_payload["model"]
-        }), 200
+        })
 
     except Exception as e:
+        import traceback
+        traceback.print_exc()
         return jsonify({"error": str(e)}), 500
 
 
