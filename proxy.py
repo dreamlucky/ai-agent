@@ -4,6 +4,7 @@ import json
 import time
 import traceback
 from flask import Flask, request, jsonify, Response, stream_with_context
+from datetime import datetime, timezone
 
 # LangChain imports
 from langchain_ollama import OllamaLLM 
@@ -23,12 +24,12 @@ app = Flask(__name__)
 
 # --- Configuration ---
 OLLAMA_BASE_URL = os.getenv("OLLAMA_BACKEND", "http://localhost:11434") # Base URL for Ollama
-DEFAULT_MODEL = os.getenv("DEFAULT_MODEL", "qwen3:30b-a3b") # Default model for the agent - UPDATED
-PROXY_VERSION = "0.3.5-langchain-model-update" # Version of this proxy
+DEFAULT_MODEL = os.getenv("DEFAULT_MODEL", "qwen3:30b-a3b") # Default model for the agent
+PROXY_VERSION = "0.3.6-langchain-ollama-stream-fix" # Version of this proxy
 
 # --- LangChain Agent Setup ---
 # Initialize LLM
-llm = OllamaLLM(base_url=OLLAMA_BASE_URL, model=DEFAULT_MODEL) # Use the imported OllamaLLM directly
+llm = OllamaLLM(base_url=OLLAMA_BASE_URL, model=DEFAULT_MODEL) 
 
 # Define a ReAct prompt template for the agent.
 react_prompt_template_str = """
@@ -89,7 +90,7 @@ def chat_proxy_langchain():
             return jsonify({"error": "Invalid JSON payload"}), 400
 
         messages = data.get("messages", [])
-        stream = data.get("stream", False)
+        stream = data.get("stream", False) # OpenWebUI usually sends "stream": true for chat
 
         if not messages:
             return jsonify({"error": "Missing 'messages' field"}), 400
@@ -101,98 +102,125 @@ def chat_proxy_langchain():
         if not last_user_message:
             return jsonify({"error": "Empty or invalid user message content"}), 400
 
-        print(f"[INFO] LangChain Agent received query: {last_user_message} (Model: {DEFAULT_MODEL})") # Added model to log
+        print(f"[INFO] LangChain Agent received query: {last_user_message} (Model: {DEFAULT_MODEL}, Stream: {stream})")
 
         if stream:
-            print("[WARN] Streaming with LangChain agent is experimental in this proxy.")
+            print("[INFO] Handling stream request for /api/chat in Ollama-compatible format.")
             
-            def generate_agent_stream():
-                chunk_id_base = f"chatcmpl-lcagent-stream-{int(time.time_ns())}"
-                created_time = int(time.time())
-                
-                yield f'data: {json.dumps({"id": f"{chunk_id_base}-0", "object": "chat.completion.chunk", "created": created_time, "model": DEFAULT_MODEL, "choices": [{"index": 0, "delta": {"role": "assistant"}, "finish_reason": None}]})}\n\n'
-                
-                full_response_content = ""
-                is_final_chunk_sent = False 
+            def generate_ollama_compatible_stream():
+                accumulated_content = ""
                 try:
+                    # Iterate over the LangChain agent's stream
                     for chunk_idx, event_chunk in enumerate(agent_executor.stream({"input": last_user_message})):
-                        content_to_stream = None
-                        is_current_chunk_final = False
+                        # Determine the content for the current chunk
+                        current_chunk_content = ""
+                        is_done_in_this_chunk = False
 
-                        if "output" in event_chunk and event_chunk["output"] is not None: 
-                            current_output = event_chunk["output"]
-                            if full_response_content != current_output:
-                                content_to_stream = current_output[len(full_response_content):] if current_output.startswith(full_response_content) else current_output
-                                full_response_content = current_output 
-                            is_current_chunk_final = True 
+                        if "output" in event_chunk and event_chunk["output"] is not None:
+                            # This typically signifies the final output from the agent
+                            full_output = event_chunk["output"]
+                            # Send only the new part of the content
+                            if full_output.startswith(accumulated_content):
+                                current_chunk_content = full_output[len(accumulated_content):]
+                            else:
+                                current_chunk_content = full_output # Or handle as a replacement if needed
+                            accumulated_content = full_output # Update accumulated content
+                            is_done_in_this_chunk = True # Mark as done as 'output' is usually final
                         
                         elif "messages" in event_chunk and event_chunk["messages"]:
-                            last_message = event_chunk["messages"][-1]
-                            if hasattr(last_message, 'content') and last_message.content:
-                                current_chunk_content = last_message.content
-                                if current_chunk_content.startswith(full_response_content):
-                                    content_to_stream = current_chunk_content[len(full_response_content):]
+                            # Handle intermediate messages if streamed by the agent (e.g., AIMessageChunk)
+                            last_message_in_chunk = event_chunk["messages"][-1]
+                            if hasattr(last_message_in_chunk, 'content') and last_message_in_chunk.content:
+                                msg_content = last_message_in_chunk.content
+                                if msg_content.startswith(accumulated_content):
+                                     current_chunk_content = msg_content[len(accumulated_content):]
                                 else:
-                                    content_to_stream = current_chunk_content 
-                                if content_to_stream:
-                                   full_response_content += content_to_stream
-                        
-                        if content_to_stream: 
-                            sse_event_data = {
-                                "id": f"{chunk_id_base}-{chunk_idx+1}",
-                                "object": "chat.completion.chunk",
-                                "created": int(time.time()),
+                                     current_chunk_content = msg_content
+                                accumulated_content += current_chunk_content # Append to overall content
+
+                        # Construct the Ollama-like stream object
+                        if current_chunk_content or is_done_in_this_chunk: # Send if there's content or it's the end
+                            ollama_chunk = {
                                 "model": DEFAULT_MODEL,
-                                "choices": [{
-                                    "index": 0,
-                                    "delta": {"content": content_to_stream},
-                                    "finish_reason": "stop" if is_current_chunk_final else None
-                                }]
+                                "created_at": datetime.now(timezone.utc).isoformat(),
+                                "message": {
+                                    "role": "assistant",
+                                    "content": current_chunk_content # Send only the delta for this chunk
+                                },
+                                "done": is_done_in_this_chunk
                             }
-                            yield f'data: {json.dumps(sse_event_data)}\n\n'
-                        
-                        if is_current_chunk_final:
-                            is_final_chunk_sent = True
-                            break 
-                    
-                    if not is_final_chunk_sent and full_response_content:
-                         yield f'data: {json.dumps({"id": f"{chunk_id_base}-final", "object": "chat.completion.chunk", "created": int(time.time()), "model": DEFAULT_MODEL, "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]})}\n\n'
-                    elif not full_response_content and not is_final_chunk_sent: 
-                         yield f'data: {json.dumps({"id": f"{chunk_id_base}-empty", "object": "chat.completion.chunk", "created": int(time.time()), "model": DEFAULT_MODEL, "choices": [{"index": 0, "delta": {"content": ""}, "finish_reason": "stop"}]})}\n\n'
+                            yield f'{json.dumps(ollama_chunk)}\n' # Newline-delimited JSON
+
+                        if is_done_in_this_chunk:
+                            break # Stop streaming if agent signals completion via 'output'
+
+                    # If the loop finished and done was not explicitly set true by an 'output' chunk,
+                    # send a final 'done: true' message with any remaining accumulated content.
+                    if not is_done_in_this_chunk:
+                        # This final chunk might have empty content if everything was streamed,
+                        # but it's important to send "done: true".
+                        final_content_delta = "" # Assume all content was streamed progressively
+                        if accumulated_content and not current_chunk_content: # if there's content but last chunk was empty
+                             pass # Content already sent
+
+                        ollama_final_chunk = {
+                            "model": DEFAULT_MODEL,
+                            "created_at": datetime.now(timezone.utc).isoformat(),
+                            "message": {
+                                "role": "assistant",
+                                "content": "" # Typically empty in the final 'done' message if content was streamed
+                            },
+                            "done": True,
+                            # You could add usage stats here if available from agent_executor
+                            # "total_duration": ..., "prompt_eval_count": ..., etc.
+                        }
+                        yield f'{json.dumps(ollama_final_chunk)}\n'
 
                 except Exception as e_stream:
-                    print(f"[ERROR] Error during agent stream: {e_stream}")
+                    print(f"[ERROR] Error during agent stream generation: {e_stream}")
                     traceback.print_exc()
-                    error_message = f"Error during agent execution: {str(e_stream)}"
-                    yield f'data: {json.dumps({"id": f"{chunk_id_base}-error", "object": "chat.completion.chunk", "created": int(time.time()), "model": DEFAULT_MODEL, "choices": [{"index": 0, "delta": {"content": error_message}, "finish_reason": "error"}]})}\n\n'
+                    error_response = {
+                        "model": DEFAULT_MODEL,
+                        "created_at": datetime.now(timezone.utc).isoformat(),
+                        "error": f"Error during agent execution: {str(e_stream)}",
+                        "done": True # Signal done even on error
+                    }
+                    yield f'{json.dumps(error_response)}\n'
                 
-                yield 'data: [DONE]\n\n'
-                print("[INFO] SSE stream to client finished (LangChain Agent).")
+                print("[INFO] Ollama-compatible stream to client finished.")
 
-            return Response(stream_with_context(generate_agent_stream()), mimetype='text/event-stream')
-        else: # Non-streaming
+            return Response(stream_with_context(generate_ollama_compatible_stream()), mimetype='application/x-ndjson') # Ollama uses this or application/json
+        
+        else: # Non-streaming response
+            print("[INFO] Handling non-stream request for /api/chat in Ollama-compatible format.")
             response_payload = agent_executor.invoke({"input": last_user_message})
             agent_final_answer = response_payload.get("output", "Sorry, I could not process your request effectively.")
 
-            return jsonify({
-                "id": f"chatcmpl-lcagent-{int(time.time_ns())}",
-                "object": "chat.completion",
-                "created": int(time.time()),
+            # Format as Ollama non-streaming /api/chat response
+            ollama_response = {
                 "model": DEFAULT_MODEL,
-                "choices": [{
-                    "index": 0,
-                    "message": {
-                        "role": "assistant",
-                        "content": agent_final_answer
-                    },
-                    "finish_reason": "stop" 
-                }],
-            })
+                "created_at": datetime.now(timezone.utc).isoformat(),
+                "message": {
+                    "role": "assistant",
+                    "content": agent_final_answer
+                },
+                "done": True,
+                # "total_duration": ..., (if available)
+                # "load_duration": ..., (if available)
+                # "prompt_eval_count": ..., (if available)
+                # "eval_count": ..., (if available)
+            }
+            return jsonify(ollama_response)
 
     except Exception as e:
         print(f"[ERROR] Unhandled exception in LangChain chat_proxy: {type(e).__name__} - {e}")
         traceback.print_exc()
-        return jsonify({"error": f"Internal Server Error in Agent: {str(e)}"}), 500
+        # Return an Ollama-like error structure if possible
+        return jsonify({
+            "error": f"Internal Server Error in Agent: {str(e)}",
+            "model": DEFAULT_MODEL, # Include model if known
+            "done": True # Indicate completion even on error
+            }), 500
 
 @app.route("/api/tags", methods=["GET"])
 def list_ollama_models():
@@ -216,17 +244,19 @@ def list_ollama_models():
 
 @app.route("/api/version", methods=["GET"])
 def proxy_version_route():
+    # This endpoint is for the proxy's version, not Ollama's.
+    # Ollama's version is usually at OLLAMA_BASE_URL/api/version if needed.
     return jsonify({"version": PROXY_VERSION, "ollama_target": OLLAMA_BASE_URL, "default_model": DEFAULT_MODEL}), 200
 
 @app.route("/")
 def health_check():
-    status = "AI Agent Proxy (LangChain enabled) is operational."
+    status = "AI Agent Proxy (LangChain enabled, Ollama-style stream) is operational."
     if not agent_executor:
         status += " WARNING: LangChain agent tools failed to load."
     return status, 200
 
 if __name__ == "__main__":
-    print(f"--- Starting Flask AI Agent Proxy (LangChain enabled) ---")
+    print(f"--- Starting Flask AI Agent Proxy (LangChain enabled, Ollama-style stream) ---")
     print(f"Version: {PROXY_VERSION}")
     print(f"Targeting Ollama at: {OLLAMA_BASE_URL}")
     print(f"Default model for agent: {DEFAULT_MODEL}")
