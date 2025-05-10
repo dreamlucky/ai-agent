@@ -25,35 +25,39 @@ app = Flask(__name__)
 # --- Configuration ---
 OLLAMA_BASE_URL = os.getenv("OLLAMA_BACKEND", "http://localhost:11434") # Base URL for Ollama
 DEFAULT_MODEL = os.getenv("DEFAULT_MODEL", "qwen3:30b-a3b") # Default model for the agent
-PROXY_VERSION = "0.3.6-langchain-ollama-stream-fix" # Version of this proxy
+PROXY_VERSION = "0.3.7-langchain-react-prompt-fix" # Version of this proxy
 
 # --- LangChain Agent Setup ---
 # Initialize LLM
 llm = OllamaLLM(base_url=OLLAMA_BASE_URL, model=DEFAULT_MODEL) 
 
 # Define a ReAct prompt template for the agent.
+# This version is more explicit about the JSON output for actions.
 react_prompt_template_str = """
 Answer the following questions as best you can. You have access to the following tools:
+
 {tools}
 
-Use the following format for your thought process and actions:
+To use a tool, please use the following JSON format:
+```json
+{{
+  "action": "tool name (must be one of [{tool_names}])",
+  "action_input": "the input to the tool"
+}}
+```
+After receiving the observation from the tool, continue with your thought process.
 
-Question: the input question you must answer
-Thought: you should always think about what to do. Break down the problem if necessary.
-Action: the action to take, should be one of [{tool_names}]
-Action Input: the input to the action
-Observation: the result of the action
+If you have the final answer, use the following format:
+Final Answer: [your final answer here]
 
-... (this Thought/Action/Action Input/Observation can repeat N times)
+You MUST use this format. Do not output XML-like tags such as <think>.
 
-Thought: I now know the final answer, or I have sufficient information to answer.
-Final Answer: the final answer to the original input question.
-
-Begin!
+Let's begin!
 
 Question: {input}
-Thought:{agent_scratchpad}
+Thought: {agent_scratchpad}
 """
+
 
 agent_prompt = PromptTemplate.from_template(react_prompt_template_str)
 
@@ -72,6 +76,8 @@ if agent_tools:
         verbose=True,
         handle_parsing_errors=True, 
         max_iterations=10,
+        # Adding a more descriptive parsing error message
+        handle_parsing_errors="Check your output and make sure it conforms to the expected JSON format for actions or 'Final Answer: ...' for answers.",
     )
 else:
     agent_executor = None 
@@ -123,9 +129,9 @@ def chat_proxy_langchain():
                             if full_output.startswith(accumulated_content):
                                 current_chunk_content = full_output[len(accumulated_content):]
                             else:
-                                current_chunk_content = full_output # Or handle as a replacement if needed
-                            accumulated_content = full_output # Update accumulated content
-                            is_done_in_this_chunk = True # Mark as done as 'output' is usually final
+                                current_chunk_content = full_output 
+                            accumulated_content = full_output 
+                            is_done_in_this_chunk = True 
                         
                         elif "messages" in event_chunk and event_chunk["messages"]:
                             # Handle intermediate messages if streamed by the agent (e.g., AIMessageChunk)
@@ -136,7 +142,8 @@ def chat_proxy_langchain():
                                      current_chunk_content = msg_content[len(accumulated_content):]
                                 else:
                                      current_chunk_content = msg_content
-                                accumulated_content += current_chunk_content # Append to overall content
+                                if current_chunk_content: # Ensure we only add if there's new content
+                                    accumulated_content += current_chunk_content
 
                         # Construct the Ollama-like stream object
                         if current_chunk_content or is_done_in_this_chunk: # Send if there's content or it's the end
@@ -145,34 +152,24 @@ def chat_proxy_langchain():
                                 "created_at": datetime.now(timezone.utc).isoformat(),
                                 "message": {
                                     "role": "assistant",
-                                    "content": current_chunk_content # Send only the delta for this chunk
+                                    "content": current_chunk_content 
                                 },
                                 "done": is_done_in_this_chunk
                             }
-                            yield f'{json.dumps(ollama_chunk)}\n' # Newline-delimited JSON
+                            yield f'{json.dumps(ollama_chunk)}\n' 
 
                         if is_done_in_this_chunk:
-                            break # Stop streaming if agent signals completion via 'output'
+                            break 
 
-                    # If the loop finished and done was not explicitly set true by an 'output' chunk,
-                    # send a final 'done: true' message with any remaining accumulated content.
                     if not is_done_in_this_chunk:
-                        # This final chunk might have empty content if everything was streamed,
-                        # but it's important to send "done: true".
-                        final_content_delta = "" # Assume all content was streamed progressively
-                        if accumulated_content and not current_chunk_content: # if there's content but last chunk was empty
-                             pass # Content already sent
-
                         ollama_final_chunk = {
                             "model": DEFAULT_MODEL,
                             "created_at": datetime.now(timezone.utc).isoformat(),
                             "message": {
                                 "role": "assistant",
-                                "content": "" # Typically empty in the final 'done' message if content was streamed
+                                "content": "" 
                             },
                             "done": True,
-                            # You could add usage stats here if available from agent_executor
-                            # "total_duration": ..., "prompt_eval_count": ..., etc.
                         }
                         yield f'{json.dumps(ollama_final_chunk)}\n'
 
@@ -183,20 +180,19 @@ def chat_proxy_langchain():
                         "model": DEFAULT_MODEL,
                         "created_at": datetime.now(timezone.utc).isoformat(),
                         "error": f"Error during agent execution: {str(e_stream)}",
-                        "done": True # Signal done even on error
+                        "done": True 
                     }
                     yield f'{json.dumps(error_response)}\n'
                 
                 print("[INFO] Ollama-compatible stream to client finished.")
 
-            return Response(stream_with_context(generate_ollama_compatible_stream()), mimetype='application/x-ndjson') # Ollama uses this or application/json
+            return Response(stream_with_context(generate_ollama_compatible_stream()), mimetype='application/x-ndjson')
         
         else: # Non-streaming response
             print("[INFO] Handling non-stream request for /api/chat in Ollama-compatible format.")
             response_payload = agent_executor.invoke({"input": last_user_message})
             agent_final_answer = response_payload.get("output", "Sorry, I could not process your request effectively.")
 
-            # Format as Ollama non-streaming /api/chat response
             ollama_response = {
                 "model": DEFAULT_MODEL,
                 "created_at": datetime.now(timezone.utc).isoformat(),
@@ -205,21 +201,16 @@ def chat_proxy_langchain():
                     "content": agent_final_answer
                 },
                 "done": True,
-                # "total_duration": ..., (if available)
-                # "load_duration": ..., (if available)
-                # "prompt_eval_count": ..., (if available)
-                # "eval_count": ..., (if available)
             }
             return jsonify(ollama_response)
 
     except Exception as e:
         print(f"[ERROR] Unhandled exception in LangChain chat_proxy: {type(e).__name__} - {e}")
         traceback.print_exc()
-        # Return an Ollama-like error structure if possible
         return jsonify({
             "error": f"Internal Server Error in Agent: {str(e)}",
-            "model": DEFAULT_MODEL, # Include model if known
-            "done": True # Indicate completion even on error
+            "model": DEFAULT_MODEL, 
+            "done": True 
             }), 500
 
 @app.route("/api/tags", methods=["GET"])
@@ -244,8 +235,6 @@ def list_ollama_models():
 
 @app.route("/api/version", methods=["GET"])
 def proxy_version_route():
-    # This endpoint is for the proxy's version, not Ollama's.
-    # Ollama's version is usually at OLLAMA_BASE_URL/api/version if needed.
     return jsonify({"version": PROXY_VERSION, "ollama_target": OLLAMA_BASE_URL, "default_model": DEFAULT_MODEL}), 200
 
 @app.route("/")
