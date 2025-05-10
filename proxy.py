@@ -25,7 +25,7 @@ app = Flask(__name__)
 # --- Configuration ---
 OLLAMA_BASE_URL = os.getenv("OLLAMA_BACKEND", "http://localhost:11434") # Base URL for Ollama
 DEFAULT_MODEL = os.getenv("DEFAULT_MODEL", "qwen3:30b-a3b") # Default model for the agent
-PROXY_VERSION = "0.3.7-langchain-react-prompt-fix" # Version of this proxy
+PROXY_VERSION = "0.3.8-langchain-kwarg-fix" # Version of this proxy
 
 # --- LangChain Agent Setup ---
 # Initialize LLM
@@ -74,10 +74,10 @@ if agent_tools:
         agent=agent,
         tools=agent_tools,
         verbose=True,
-        handle_parsing_errors=True, 
+        # handle_parsing_errors=True, # This was the first instance
         max_iterations=10,
-        # Adding a more descriptive parsing error message
-        handle_parsing_errors="Check your output and make sure it conforms to the expected JSON format for actions or 'Final Answer: ...' for answers.",
+        # Corrected: Only one instance of handle_parsing_errors
+        handle_parsing_errors="Check your output and make sure it conforms to the expected JSON format for actions or 'Final Answer: ...' for answers." 
     )
 else:
     agent_executor = None 
