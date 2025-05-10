@@ -7,7 +7,7 @@ from flask import Flask, request, jsonify, Response, stream_with_context
 
 # LangChain imports
 # from langchain_community.llms import Ollama # Deprecated
-from langchain_ollama import Ollama as OllamaLLM # CORRECTED OLLAMA IMPORT
+from langchain_ollama import OllamaLLM # CORRECTED OLLAMA IMPORT (directly import OllamaLLM)
 from langchain.agents import AgentExecutor, create_react_agent
 from langchain_core.prompts import PromptTemplate
 from langchain.agents.output_parsers.react_json_single_input import ReActJsonSingleInputOutputParser
@@ -25,12 +25,11 @@ app = Flask(__name__)
 # --- Configuration ---
 OLLAMA_BASE_URL = os.getenv("OLLAMA_BACKEND", "http://localhost:11434") # Base URL for Ollama
 DEFAULT_MODEL = os.getenv("DEFAULT_MODEL", "llama3:latest") # Default model for the agent
-PROXY_VERSION = "0.3.3-langchain-ollama-fix" # Version of this proxy
+PROXY_VERSION = "0.3.4-langchain-ollamallm-import-fix" # Version of this proxy
 
 # --- LangChain Agent Setup ---
 # Initialize LLM
-# llm = Ollama(base_url=OLLAMA_BASE_URL, model=DEFAULT_MODEL) # Old way
-llm = OllamaLLM(base_url=OLLAMA_BASE_URL, model=DEFAULT_MODEL) # CORRECTED OLLAMA INSTANTIATION
+llm = OllamaLLM(base_url=OLLAMA_BASE_URL, model=DEFAULT_MODEL) # Use the imported OllamaLLM directly
 
 # Define a ReAct prompt template for the agent.
 react_prompt_template_str = """
@@ -115,7 +114,7 @@ def chat_proxy_langchain():
                 yield f'data: {json.dumps({"id": f"{chunk_id_base}-0", "object": "chat.completion.chunk", "created": created_time, "model": DEFAULT_MODEL, "choices": [{"index": 0, "delta": {"role": "assistant"}, "finish_reason": None}]})}\n\n'
                 
                 full_response_content = ""
-                is_final_chunk_sent = False # To ensure [DONE] is sent after the loop if final chunk was processed inside
+                is_final_chunk_sent = False 
                 try:
                     for chunk_idx, event_chunk in enumerate(agent_executor.stream({"input": last_user_message})):
                         content_to_stream = None
@@ -123,28 +122,23 @@ def chat_proxy_langchain():
 
                         if "output" in event_chunk and event_chunk["output"] is not None: 
                             current_output = event_chunk["output"]
-                            # Check if this output is different from what we've already accumulated
                             if full_response_content != current_output:
                                 content_to_stream = current_output[len(full_response_content):] if current_output.startswith(full_response_content) else current_output
-                                full_response_content = current_output # Update full response with the entire output from this chunk
-                            is_current_chunk_final = True # 'output' key usually signals the end of agent execution or a major step.
+                                full_response_content = current_output 
+                            is_current_chunk_final = True 
                         
                         elif "messages" in event_chunk and event_chunk["messages"]:
-                            # This part handles intermediate messages if your agent streams them.
-                            # For ReAct, the most important is often the final "output".
                             last_message = event_chunk["messages"][-1]
                             if hasattr(last_message, 'content') and last_message.content:
                                 current_chunk_content = last_message.content
-                                # Avoid re-sending parts of the content if it's cumulative
                                 if current_chunk_content.startswith(full_response_content):
                                     content_to_stream = current_chunk_content[len(full_response_content):]
                                 else:
-                                    # This case might indicate a new thought or observation, handle as needed
                                     content_to_stream = current_chunk_content 
                                 if content_to_stream:
                                    full_response_content += content_to_stream
                         
-                        if content_to_stream: # Only yield if there's new content
+                        if content_to_stream: 
                             sse_event_data = {
                                 "id": f"{chunk_id_base}-{chunk_idx+1}",
                                 "object": "chat.completion.chunk",
@@ -160,18 +154,12 @@ def chat_proxy_langchain():
                         
                         if is_current_chunk_final:
                             is_final_chunk_sent = True
-                            break # Exit loop if we consider 'output' as the definitive end for this stream
+                            break 
                     
-                    # If the loop finished but we didn't send a final chunk with "stop"
                     if not is_final_chunk_sent and full_response_content:
-                         final_delta_content = "" # No new content, just signaling stop
-                         # Check if the last piece of content was already sent
-                         # This part is tricky; ideally the agent's stream clearly signals its end.
-                         # For now, if full_response_content exists and no "stop" was sent, send one.
                          yield f'data: {json.dumps({"id": f"{chunk_id_base}-final", "object": "chat.completion.chunk", "created": int(time.time()), "model": DEFAULT_MODEL, "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]})}\n\n'
-                    elif not full_response_content and not is_final_chunk_sent: # Agent produced no text output
+                    elif not full_response_content and not is_final_chunk_sent: 
                          yield f'data: {json.dumps({"id": f"{chunk_id_base}-empty", "object": "chat.completion.chunk", "created": int(time.time()), "model": DEFAULT_MODEL, "choices": [{"index": 0, "delta": {"content": ""}, "finish_reason": "stop"}]})}\n\n'
-
 
                 except Exception as e_stream:
                     print(f"[ERROR] Error during agent stream: {e_stream}")
