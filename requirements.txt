@@ -3,6 +3,7 @@ langchain
 langchain-community
 openai  # Needed for some LangChain internals
 ollama
+langchain-ollama
 
 # Web Search
 duckduckgo-search
