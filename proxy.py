@@ -1,275 +1,247 @@
-from flask import Flask, request, jsonify, Response, stream_with_context
-import requests
+# proxy.py
 import os
 import json
 import time
-import traceback # Added for more detailed error logging
+import traceback
+from flask import Flask, request, jsonify, Response, stream_with_context
 
-# --- Mock/Placeholder for run_duckduckgo ---
-# Replace this with your actual tools.search import and implementation
-# from tools.search import run_duckduckgo
-def run_duckduckgo(query: str) -> str:
-    """
-    Placeholder for your DuckDuckGo search function.
-    It should return a string or a serializable structure.
-    """
-    print(f"[INFO] Mock DuckDuckGo search for: {query}")
-    # Simulate some search results as a string
-    return f"Search results for '{query}':\n1. Mock Result Alpha for {query}.\n2. Mock Result Beta for {query}."
-# --- End Mock ---
+# LangChain imports
+from langchain_community.llms import Ollama
+from langchain.agents import AgentExecutor, create_react_agent
+from langchain_core.prompts import PromptTemplate
+from langchain.agents.format_scratchpad import format_log_to_str
+from langchain.agents.output_parsers.react_json_single_input import ReActSingleInputOutputParser
+
+
+# Import your tools from tools.custom_tools
+# Make sure tools/custom_tools.py is in the same directory or accessible in PYTHONPATH
+# and contains the 'agent_tools' list and the tool functions.
+try:
+    from tools.custom_tools import agent_tools
+except ImportError:
+    print("[ERROR] Could not import 'agent_tools' from 'tools.custom_tools'. Make sure the file exists and is correctly structured.")
+    # Fallback to an empty list or a default tool if you want the app to start anyway
+    agent_tools = [] 
+
 
 app = Flask(__name__)
 
-OLLAMA_URL = os.getenv("OLLAMA_BACKEND", "http://localhost:11434")
-DEFAULT_MODEL = os.getenv("DEFAULT_MODEL", "qwen3:30b-a3b") # Made default model configurable
+# --- Configuration ---
+OLLAMA_BASE_URL = os.getenv("OLLAMA_BACKEND", "http://localhost:11434") # Base URL for Ollama
+DEFAULT_MODEL = os.getenv("DEFAULT_MODEL", "llama3:latest") # Default model for the agent
+PROXY_VERSION = "0.3.0-langchain" # Version of this proxy
+
+# --- LangChain Agent Setup ---
+# Initialize LLM
+# The Ollama class in langchain_community.llms expects the base URL.
+llm = Ollama(base_url=OLLAMA_BASE_URL, model=DEFAULT_MODEL)
+
+# Define a ReAct prompt template for the agent.
+# This template guides the LLM on how to think and use tools.
+# The `tools` and `tool_names` variables will be populated by LangChain.
+# `input` is the user's query.
+# `agent_scratchpad` is where the agent's thoughts and tool usage history are stored.
+react_prompt_template_str = """
+Answer the following questions as best you can. You have access to the following tools:
+{tools}
+
+Use the following format for your thought process and actions:
+
+Question: the input question you must answer
+Thought: you should always think about what to do. Break down the problem if necessary.
+Action: the action to take, should be one of [{tool_names}]
+Action Input: the input to the action
+Observation: the result of the action
+
+... (this Thought/Action/Action Input/Observation can repeat N times)
+
+Thought: I now know the final answer, or I have sufficient information to answer.
+Final Answer: the final answer to the original input question.
+
+Begin!
+
+Question: {input}
+Thought:{agent_scratchpad}
+"""
+
+agent_prompt = PromptTemplate.from_template(react_prompt_template_str)
+
+# Create the ReAct agent
+# The agent needs the LLM, the tools, and the prompt.
+if agent_tools: # Only create agent if tools were loaded
+    agent = create_react_agent(
+        llm=llm,
+        tools=agent_tools,
+        prompt=agent_prompt,
+        output_parser=ReActSingleInputOutputParser() # Added for more robust output parsing
+    )
+
+    # Create the Agent Executor
+    # This runs the agent, executes tools, and manages the interaction loop.
+    agent_executor = AgentExecutor(
+        agent=agent,
+        tools=agent_tools,
+        verbose=True,  # Set to True for debugging to see agent's thoughts
+        handle_parsing_errors=True, # Useful for debugging LLM output issues
+        max_iterations=10, # Prevent overly long loops
+        # early_stopping_method="generate" # Stop if LLM generates Final Answer
+    )
+else:
+    agent_executor = None # No agent if tools failed to load
+    print("[WARN] LangChain Agent Executor not initialized because tools could not be loaded.")
+
+# --- Flask Routes ---
 
 @app.route("/api/chat", methods=["POST"])
-def chat_proxy():
+def chat_proxy_langchain():
+    """
+    Handles chat requests, potentially using the LangChain agent if configured.
+    """
+    if not agent_executor:
+        return jsonify({"error": "LangChain agent is not available due to tool loading issues."}), 503
+
     try:
         data = request.get_json()
         if not data:
             return jsonify({"error": "Invalid JSON payload"}), 400
 
         messages = data.get("messages", [])
-        model = data.get("model", DEFAULT_MODEL)
+        # model_requested = data.get("model", DEFAULT_MODEL) # Agent uses model set in `llm`
         stream = data.get("stream", False)
 
         if not messages:
             return jsonify({"error": "Missing 'messages' field"}), 400
 
-        # Construct prompt for Ollama's /api/generate
-        # This flattens history. For better chat, consider Ollama's /api/chat if available
-        # and modify payload accordingly.
-        prompt_parts = []
-        for msg in messages:
-            role = msg.get("role", "user").capitalize()
-            content = msg.get("content", "")
-            prompt_parts.append(f"{role}: {content}")
-        # Add a final marker for the assistant to start generation, if desired by the model
-        prompt = "\n".join(prompt_parts) + "\nAssistant:"
-
-
-        # --- DuckDuckGo Tool Intercept ---
-        # Basic keyword detection in the last user message.
-        # For more complex tooling, a dedicated tool dispatcher and parser would be better.
-        last_message_content = messages[-1].get("content", "").lower() if messages else ""
-        is_search_request = False
-        search_query = ""
-
-        if "search for " in last_message_content:
-            search_query = last_message_content.split("search for ", 1)[1].strip()
-            is_search_request = True
-        elif "look up " in last_message_content:
-            search_query = last_message_content.split("look up ", 1)[1].strip()
-            is_search_request = True
+        # For LangChain agents, typically pass the latest user query.
+        # For chat history, you'd need to integrate memory into the agent_executor.
+        last_user_message = ""
+        if messages and isinstance(messages, list) and len(messages) > 0:
+            last_user_message = messages[-1].get("content", "")
         
-        if is_search_request and search_query:
-            print(f"[INFO] Intercepted search query: '{search_query}'")
-            search_results_text = run_duckduckgo(search_query)
+        if not last_user_message:
+            return jsonify({"error": "Empty or invalid user message content"}), 400
+
+        print(f"[INFO] LangChain Agent received query: {last_user_message}")
+
+        # --- Agent Invocation ---
+        # Streaming agent thoughts and actions is complex to map to OpenAI's SSE.
+        # This example focuses on non-streaming for the final answer.
+        # For streaming, you'd iterate over `agent_executor.stream()` and format chunks.
+
+        if stream:
+            # Placeholder for streaming logic.
+            # True streaming of agent steps requires careful handling of the `agent_executor.stream()` output.
+            # Each event from the stream (tool call, thought, final answer) would need to be formatted.
+            print("[WARN] Streaming with LangChain agent is experimental in this proxy.")
             
-            tool_model_name = f"duckduckgo_tool/{model}" # Indicate tool usage with base model
+            def generate_agent_stream():
+                # This is a simplified conceptual streaming.
+                # Real implementation needs to map agent_executor.stream() events to OpenAI SSE.
+                chunk_id_base = f"chatcmpl-lcagent-stream-{int(time.time_ns())}"
+                created_time = int(time.time())
+                
+                # Send an initial delta establishing role (OpenAI client convention)
+                yield f'data: {json.dumps({"id": f"{chunk_id_base}-0", "object": "chat.completion.chunk", "created": created_time, "model": DEFAULT_MODEL, "choices": [{"index": 0, "delta": {"role": "assistant"}, "finish_reason": None}]})}\n\n'
+                
+                full_response_content = ""
+                try:
+                    # agent_executor.stream returns dictionaries with actions, steps, messages etc.
+                    for chunk_idx, event_chunk in enumerate(agent_executor.stream({"input": last_user_message})):
+                        # You need to inspect event_chunk to see what it contains (e.g., 'actions', 'steps', 'messages')
+                        # and decide what to stream. For this example, we'll just try to get 'output' if it's the final answer.
+                        # A more robust solution would parse the 'log' or specific keys from `event_chunk`.
+                        
+                        # This is a very basic way to get parts of the thought process or final output
+                        content_to_stream = None
+                        is_final_chunk = False
 
-            if stream:
-                def stream_search_response():
-                    # Initial delta (optional, but can set role)
-                    # yield f'data: {json.dumps({"id": f"chatcmpl-ddg-{time.time_ns()}", "object": "chat.completion.chunk", "created": int(time.time()), "model": tool_model_name, "choices": [{"index": 0, "delta": {"role": "assistant"}, "finish_reason": None}]})}\n\n'
+                        if "output" in event_chunk: # Typically means final answer
+                            content_to_stream = event_chunk["output"]
+                            if full_response_content: # If we streamed parts before, send only the new part
+                                content_to_stream = content_to_stream.replace(full_response_content, "", 1)
+                            full_response_content += content_to_stream
+                            is_final_chunk = True
+                        elif "messages" in event_chunk and event_chunk["messages"]:
+                            # messages are usually AIMessage, HumanMessage etc.
+                            # Get content from the last AIMessageChunk if available
+                            last_message = event_chunk["messages"][-1]
+                            if hasattr(last_message, 'content'):
+                                content_to_stream = last_message.content
+                                if full_response_content:
+                                     content_to_stream = content_to_stream.replace(full_response_content, "", 1)
+                                full_response_content += content_to_stream
+                        # Add more conditions here to stream intermediate thoughts/tool outputs if desired
+
+                        if content_to_stream:
+                            sse_event_data = {
+                                "id": f"{chunk_id_base}-{chunk_idx+1}",
+                                "object": "chat.completion.chunk",
+                                "created": int(time.time()),
+                                "model": DEFAULT_MODEL,
+                                "choices": [{
+                                    "index": 0,
+                                    "delta": {"content": content_to_stream},
+                                    "finish_reason": "stop" if is_final_chunk else None
+                                }]
+                            }
+                            yield f'data: {json.dumps(sse_event_data)}\n\n'
+                        
+                        if is_final_chunk:
+                            break # Stop after final output
                     
-                    # Content delta with search results
-                    content_payload = {
-                        "id": f"chatcmpl-ddg-{time.time_ns()}",
-                        "object": "chat.completion.chunk",
-                        "created": int(time.time()),
-                        "model": tool_model_name,
-                        "choices": [{
-                            "index": 0,
-                            "delta": {"content": search_results_text}, # Send all results as one content chunk
-                            "finish_reason": None 
-                        }]
-                    }
-                    yield f'data: {json.dumps(content_payload)}\n\n'
-                    
-                    # Final delta indicating the turn is over (e.g., due to tool use)
-                    final_payload = {
-                        "id": f"chatcmpl-ddg-{time.time_ns()}",
-                        "object": "chat.completion.chunk",
-                        "created": int(time.time()),
-                        "model": tool_model_name,
-                        "choices": [{
-                            "index": 0,
-                            "delta": {}, # Empty delta
-                            "finish_reason": "stop" # Or "tool_calls" if your client handles that
-                        }]
-                    }
-                    yield f'data: {json.dumps(final_payload)}\n\n'
-                    yield 'data: [DONE]\n\n'
-                return Response(stream_with_context(stream_search_response()), mimetype='text/event-stream')
-            else: # Non-streaming search result
-                return jsonify({
-                    "id": f"chatcmpl-ddg-{time.time_ns()}",
-                    "object": "chat.completion",
-                    "created": int(time.time()),
-                    "model": tool_model_name,
-                    "choices": [{
-                        "index": 0,
-                        "message": {
-                            "role": "assistant",
-                            "content": search_results_text
-                        },
-                        "finish_reason": "stop" # Or "tool_calls"
-                    }],
-                    # "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0} # Placeholder
-                })
-        # --- End DuckDuckGo Tool Intercept ---
+                    if not full_response_content: # If loop finished with no output (should not happen with ReAct)
+                         yield f'data: {json.dumps({"id": f"{chunk_id_base}-final", "object": "chat.completion.chunk", "created": int(time.time()), "model": DEFAULT_MODEL, "choices": [{"index": 0, "delta": {"content": "Agent finished without explicit output."}, "finish_reason": "stop"}]})}\n\n'
 
+                except Exception as e_stream:
+                    print(f"[ERROR] Error during agent stream: {e_stream}")
+                    traceback.print_exc()
+                    error_message = f"Error during agent execution: {str(e_stream)}"
+                    yield f'data: {json.dumps({"id": f"{chunk_id_base}-error", "object": "chat.completion.chunk", "created": int(time.time()), "model": DEFAULT_MODEL, "choices": [{"index": 0, "delta": {"content": error_message}, "finish_reason": "error"}]})}\n\n'
+                
+                yield 'data: [DONE]\n\n'
+                print("[INFO] SSE stream to client finished (LangChain Agent).")
 
-        # --- Ollama Backend Call ---
-        ollama_payload = {
-            "model": model,
-            "prompt": prompt,
-            "stream": stream,
-            # "options": {"temperature": 0.7} # Example option
-            # If using Ollama's /api/chat endpoint, the payload structure would be different:
-            # "messages": messages 
-        }
-        
-        ollama_api_url = f"{OLLAMA_URL}/api/generate" # Using /api/generate
-        print(f"[INFO] Relaying to Ollama ({ollama_api_url}) with payload: {json.dumps(ollama_payload, indent=2)}")
+            return Response(stream_with_context(generate_agent_stream()), mimetype='text/event-stream')
+        else:
+            # Non-streaming invocation
+            # The `agent_executor.invoke` method takes the input and returns the final result.
+            # The input to the ReAct agent is typically a dictionary with the key "input".
+            # The `tool_names` and `tools` are usually handled internally by the agent setup.
+            response_payload = agent_executor.invoke({"input": last_user_message})
+            agent_final_answer = response_payload.get("output", "Sorry, I could not process your request effectively.")
 
-        upstream_response = requests.post(
-            ollama_api_url,
-            json=ollama_payload,
-            stream=stream,
-            timeout=300  # 5 minutes for potentially long generations
-        )
-        upstream_response.raise_for_status() # Raise HTTPError for 4xx/5xx status codes
-
-        if not stream: # Non-streaming response from Ollama
-            ollama_json = upstream_response.json()
-            generated_content = ollama_json.get("response", "").strip()
-            # Ollama's non-streaming /api/generate also returns model, created_at, done, context, and timing fields
-            
-            # Format for OpenAI compatibility
+            # Format for OpenAI compatibility (non-streaming)
             return jsonify({
-                "id": f"chatcmpl-ollama-{time.time_ns()}",
+                "id": f"chatcmpl-lcagent-{int(time.time_ns())}",
                 "object": "chat.completion",
-                "created": int(time.time()), # Standard Unix timestamp
-                "model": ollama_json.get("model", model), # Use model from Ollama if available
+                "created": int(time.time()),
+                "model": DEFAULT_MODEL,
                 "choices": [{
                     "index": 0,
                     "message": {
                         "role": "assistant",
-                        "content": generated_content
+                        "content": agent_final_answer
                     },
-                    "finish_reason": "stop" # Ollama's /generate implies stop when done
+                    "finish_reason": "stop" 
                 }],
-                # "usage": { # You might parse these from Ollama's detailed response if needed
-                #     "prompt_tokens": ollama_json.get("prompt_eval_count", 0),
-                #     "completion_tokens": ollama_json.get("eval_count", 0),
-                #     "total_tokens": ollama_json.get("prompt_eval_count", 0) + ollama_json.get("eval_count", 0)
-                # }
+                # "usage": { ... } # Token usage is harder to get accurately from ReAct agents
             })
-        else: # Streaming response from Ollama
-            def generate_openai_formatted_stream():
-                # Send initial delta establishing role (OpenAI client convention)
-                initial_created_time = int(time.time())
-                initial_chunk_id = f"chatcmpl-ollama-stream-{time.time_ns()}"
-                yield f'data: {json.dumps({"id": initial_chunk_id, "object": "chat.completion.chunk", "created": initial_created_time, "model": model, "choices": [{"index": 0, "delta": {"role": "assistant"}, "finish_reason": None}]})}\n\n'
-                
-                # For debugging, to see the full sequence of lines from Ollama if issues arise
-                # ollama_raw_stream_lines_for_debug = []
 
-                for line_bytes in upstream_response.iter_lines():
-                    if not line_bytes: # Skip empty keep-alive lines
-                        continue
-                    
-                    line_str = line_bytes.decode('utf-8')
-                    # ollama_raw_stream_lines_for_debug.append(line_str)
-
-                    try:
-                        ollama_chunk = json.loads(line_str)
-                        # Expected fields in Ollama /api/generate stream chunks:
-                        # "model", "created_at", "response" (the text chunk), "done" (boolean)
-                        # Final chunk (done=true) may also have: "context", "total_duration", "load_duration", etc.
-                        
-                        content_text = ollama_chunk.get("response", "")
-                        is_done = ollama_chunk.get("done", False)
-                        
-                        current_chunk_id = f"chatcmpl-ollama-stream-{time.time_ns()}"
-                        current_created_time = int(time.time()) # Can also use ollama_chunk.get("created_at") if parsed
-                        
-                        delta_payload = {}
-                        if content_text: # Only include "content" if there's text
-                            delta_payload["content"] = content_text
-                        
-                        choice_item = {
-                            "index": 0,
-                            "delta": delta_payload,
-                            "finish_reason": None
-                        }
-
-                        if is_done:
-                            choice_item["finish_reason"] = "stop"
-                            # Optionally, include usage from the final ollama_chunk if available and desired
-                            # usage_stats_from_ollama_final_chunk = { ... }
-
-                        sse_event_data = {
-                            "id": current_chunk_id,
-                            "object": "chat.completion.chunk",
-                            "created": current_created_time,
-                            "model": ollama_chunk.get("model", model), # Use model from chunk
-                            "choices": [choice_item]
-                            # if is_done and usage_stats_from_ollama_final_chunk:
-                            #     sse_event_data["usage"] = usage_stats_from_ollama_final_chunk
-                        }
-                        yield f'data: {json.dumps(sse_event_data)}\n\n'
-
-                        if is_done:
-                            print(f"[INFO] Ollama stream part marked done. Final chunk: {ollama_chunk}")
-                            break # Exit the loop as Ollama has finished
-
-                    except json.JSONDecodeError:
-                        # This means Ollama sent a line that wasn't valid JSON.
-                        print(f"[WARN] Ollama stream: Skipping non-JSON line: '{line_str}'")
-                        continue 
-                    except Exception as e_inner:
-                        print(f"[ERROR] Ollama stream: Error processing line '{line_str}': {e_inner}")
-                        # Depending on severity, you might break or continue. Breaking is safer.
-                        break
-                
-                # After the loop (either completed via "done:true" or broke due to error),
-                # send the [DONE] marker for OpenAI-compatible clients.
-                yield 'data: [DONE]\n\n'
-                # print(f"[DEBUG] Full raw Ollama stream received:\n{''.join(ollama_raw_stream_lines_for_debug)}")
-                print("[INFO] SSE stream to client finished.")
-
-            return Response(stream_with_context(generate_openai_formatted_stream()), mimetype='text/event-stream')
-
-    except requests.exceptions.HTTPError as e:
-        status_code = e.response.status_code if e.response is not None else 500
-        error_text = e.response.text if e.response is not None else "Unknown Ollama HTTP Error"
-        print(f"[ERROR] Ollama HTTP Error ({status_code}): {error_text}")
-        try:
-            ollama_error_json = e.response.json()
-            error_detail = ollama_error_json.get("error", error_text)
-        except ValueError: # Not JSON
-            error_detail = error_text
-        return jsonify({"error": f"Ollama upstream error: {error_detail}"}), status_code
-    except requests.exceptions.RequestException as e: # Catches DNS errors, connection refused, timeouts etc.
-        print(f"[ERROR] Ollama Request Exception: {e}")
-        return jsonify({"error": f"Cannot connect to Ollama: {str(e)}"}), 503 # Service Unavailable
     except Exception as e:
-        print(f"[ERROR] Unhandled exception in /api/chat: {type(e).__name__} - {e}")
-        traceback.print_exc() # Print full traceback for debugging
-        return jsonify({"error": f"Internal Server Error: {str(e)}"}), 500
+        print(f"[ERROR] Unhandled exception in LangChain chat_proxy: {type(e).__name__} - {e}")
+        traceback.print_exc()
+        return jsonify({"error": f"Internal Server Error in Agent: {str(e)}"}), 500
 
 @app.route("/api/tags", methods=["GET"])
 def list_ollama_models():
+    """
+    Proxies requests to Ollama's /api/tags to list available models.
+    """
     try:
-        response = requests.get(f"{OLLAMA_URL}/api/tags", timeout=10) # Added timeout
-        response.raise_for_status() # Raise an exception for HTTP error codes
-        # Ollama's /api/tags returns: {"models": [{"name": "model:tag", "modified_at": ..., "size": ...}]}
-        # This format is often directly usable by clients that support Ollama.
-        # If a specific OpenAI-like model list format is needed by the client, transform here.
+        # Using OLLAMA_BASE_URL which should be like http://ollama_host:port
+        response = requests.get(f"{OLLAMA_BASE_URL}/api/tags", timeout=10)
+        response.raise_for_status()
+        # This format is often directly usable by clients like Open WebUI.
         return jsonify(response.json()), response.status_code
     except requests.exceptions.HTTPError as e:
         status_code = e.response.status_code if e.response is not None else 500
@@ -285,18 +257,32 @@ def list_ollama_models():
         return jsonify({"error": f"Internal Server Error (tags): {str(e)}"}), 500
 
 @app.route("/api/version", methods=["GET"])
-def proxy_version():
-    # This is the version of THIS proxy script
-    return jsonify({"version": "0.2.0-updated", "ollama_target": OLLAMA_URL}), 200
+def proxy_version_route():
+    """
+    Returns the version of this proxy script and the targeted Ollama backend.
+    """
+    return jsonify({"version": PROXY_VERSION, "ollama_target": OLLAMA_BASE_URL, "default_model": DEFAULT_MODEL}), 200
 
 @app.route("/")
 def health_check():
-    # A more robust health check could try a quick HEAD request to OLLAMA_URL
-    return "AI Agent Proxy (Ollama compatible) is operational.", 200
+    """
+    Basic health check for the proxy.
+    """
+    status = "AI Agent Proxy (LangChain enabled) is operational."
+    if not agent_executor:
+        status += " WARNING: LangChain agent tools failed to load."
+    return status, 200
 
 if __name__ == "__main__":
-    print(f"Starting Flask AI Agent Proxy for Ollama at {OLLAMA_URL}")
-    print(f"Default model for /api/chat: {DEFAULT_MODEL}")
+    print(f"--- Starting Flask AI Agent Proxy (LangChain enabled) ---")
+    print(f"Version: {PROXY_VERSION}")
+    print(f"Targeting Ollama at: {OLLAMA_BASE_URL}")
+    print(f"Default model for agent: {DEFAULT_MODEL}")
+    if agent_executor:
+        print(f"Agent initialized with tools: {[tool.name for tool in agent_tools]}")
+    else:
+        print("[CRITICAL] LangChain agent_executor is NOT initialized. Tool-based chat will fail.")
+    
     # For production, use a proper WSGI server like Gunicorn or Waitress.
-    # Example: gunicorn -w 4 -b 0.0.0.0:5000 your_script_name:app
+    # Example: gunicorn -w 4 -b 0.0.0.0:5000 proxy:app
     app.run(host="0.0.0.0", port=5000, debug=True) # debug=True is for development ONLY

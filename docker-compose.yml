@@ -4,10 +4,6 @@ services:
     container_name: ai-agent
     ports:
       - "11435:5000"  # Maps proxy to host
-    volumes:
-      - /mnt/ai/data:/data
-      - /mnt/ai/tools:/tools
-      - /mnt/ai/prompts:/prompts
     environment:
       - OLLAMA_BACKEND=http://192.168.1.8:11434
     restart: unless-stopped
