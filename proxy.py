@@ -25,14 +25,13 @@ app = Flask(__name__)
 # --- Configuration ---
 OLLAMA_BASE_URL = os.getenv("OLLAMA_BACKEND", "http://localhost:11434") # Base URL for Ollama
 DEFAULT_MODEL = os.getenv("DEFAULT_MODEL", "qwen3:30b-a3b") # Default model for the agent
-PROXY_VERSION = "0.3.9-langchain-stricter-prompt" # Version of this proxy
+PROXY_VERSION = "0.4.0-langchain-stream-refine" # Version of this proxy
 
 # --- LangChain Agent Setup ---
 # Initialize LLM
 llm = OllamaLLM(base_url=OLLAMA_BASE_URL, model=DEFAULT_MODEL) 
 
 # Define a ReAct prompt template for the agent.
-# This version is more explicit about the JSON output for actions and no-tool responses.
 react_prompt_template_str = """
 Answer the following questions as best you can. You have access to the following tools:
 
@@ -97,7 +96,7 @@ def chat_proxy_langchain():
             return jsonify({"error": "Invalid JSON payload"}), 400
 
         messages = data.get("messages", [])
-        stream = data.get("stream", False) # OpenWebUI usually sends "stream": true for chat
+        stream = data.get("stream", False) 
 
         if not messages:
             return jsonify({"error": "Missing 'messages' field"}), 400
@@ -115,75 +114,72 @@ def chat_proxy_langchain():
             print("[INFO] Handling stream request for /api/chat in Ollama-compatible format.")
             
             def generate_ollama_compatible_stream():
-                accumulated_content = ""
+                accumulated_final_output = "" # To keep track of what part of the final answer has been sent
+                is_done_sent = False # Flag to ensure 'done:true' is sent only once at the very end
+
                 try:
                     # Iterate over the LangChain agent's stream
-                    for chunk_idx, event_chunk in enumerate(agent_executor.stream({"input": last_user_message})):
-                        # Determine the content for the current chunk
-                        current_chunk_content = ""
-                        is_done_in_this_chunk = False
-
+                    for event_chunk in agent_executor.stream({"input": last_user_message}):
+                        # The 'output' key in event_chunk usually contains the agent's final answer
+                        # or significant intermediate results that are meant to be part of the final answer.
                         if "output" in event_chunk and event_chunk["output"] is not None:
-                            # This typically signifies the final output from the agent
-                            full_output = event_chunk["output"]
-                            # Send only the new part of the content
-                            if full_output.startswith(accumulated_content):
-                                current_chunk_content = full_output[len(accumulated_content):]
+                            full_chunk_output = event_chunk["output"]
+                            
+                            # Determine the new part of the content to stream
+                            # This handles cases where 'output' might be cumulative or repeated
+                            new_content_to_stream = ""
+                            if full_chunk_output.startswith(accumulated_final_output):
+                                new_content_to_stream = full_chunk_output[len(accumulated_final_output):]
                             else:
-                                current_chunk_content = full_output 
-                            accumulated_content = full_output 
-                            is_done_in_this_chunk = True 
+                                # If it doesn't start with accumulated, it might be a fresh/replaced output
+                                new_content_to_stream = full_chunk_output
+                                accumulated_final_output = "" # Reset accumulated if output is not a continuation
+
+                            if new_content_to_stream:
+                                accumulated_final_output += new_content_to_stream
+                                ollama_chunk = {
+                                    "model": DEFAULT_MODEL,
+                                    "created_at": datetime.now(timezone.utc).isoformat(),
+                                    "message": {
+                                        "role": "assistant",
+                                        "content": new_content_to_stream 
+                                    },
+                                    "done": False # Not done yet, more might come or a final 'done' chunk
+                                }
+                                print(f"[DEBUG] Streaming chunk: {json.dumps(ollama_chunk)}")
+                                yield f'{json.dumps(ollama_chunk)}\n'
                         
-                        elif "messages" in event_chunk and event_chunk["messages"]:
-                            # Handle intermediate messages if streamed by the agent (e.g., AIMessageChunk)
-                            last_message_in_chunk = event_chunk["messages"][-1]
-                            if hasattr(last_message_in_chunk, 'content') and last_message_in_chunk.content:
-                                msg_content = last_message_in_chunk.content
-                                if msg_content.startswith(accumulated_content):
-                                     current_chunk_content = msg_content[len(accumulated_content):]
-                                else:
-                                     current_chunk_content = msg_content
-                                if current_chunk_content: # Ensure we only add if there's new content
-                                    accumulated_content += current_chunk_content
+                        # You can add more sophisticated logic here to inspect other parts of event_chunk
+                        # if you want to stream intermediate thoughts, but for now, we focus on 'output'.
+                        # For example, if 'messages' contains AIMessageChunk, you might stream its content.
+                        # However, be careful not to duplicate content already handled by 'output'.
 
-                        # Construct the Ollama-like stream object
-                        if current_chunk_content or is_done_in_this_chunk: # Send if there's content or it's the end
-                            ollama_chunk = {
-                                "model": DEFAULT_MODEL,
-                                "created_at": datetime.now(timezone.utc).isoformat(),
-                                "message": {
-                                    "role": "assistant",
-                                    "content": current_chunk_content 
-                                },
-                                "done": is_done_in_this_chunk
-                            }
-                            yield f'{json.dumps(ollama_chunk)}\n' 
-
-                        if is_done_in_this_chunk:
-                            break 
-
-                    if not is_done_in_this_chunk: # If loop finished but done was not explicitly set true
-                        ollama_final_chunk = {
+                    # After the loop, send the final 'done: true' message
+                    if not is_done_sent:
+                        final_done_chunk = {
                             "model": DEFAULT_MODEL,
                             "created_at": datetime.now(timezone.utc).isoformat(),
                             "message": {
                                 "role": "assistant",
-                                "content": "" # Content should have been streamed; this is just the done signal
+                                "content": "" # No new content, just signaling completion
                             },
                             "done": True,
                         }
-                        yield f'{json.dumps(ollama_final_chunk)}\n'
+                        print(f"[DEBUG] Streaming final done chunk: {json.dumps(final_done_chunk)}")
+                        yield f'{json.dumps(final_done_chunk)}\n'
+                        is_done_sent = True
 
                 except Exception as e_stream:
                     print(f"[ERROR] Error during agent stream generation: {e_stream}")
                     traceback.print_exc()
-                    error_response = {
-                        "model": DEFAULT_MODEL,
-                        "created_at": datetime.now(timezone.utc).isoformat(),
-                        "error": f"Error during agent execution: {str(e_stream)}",
-                        "done": True 
-                    }
-                    yield f'{json.dumps(error_response)}\n'
+                    if not is_done_sent: # Ensure done is sent even on error
+                        error_response = {
+                            "model": DEFAULT_MODEL,
+                            "created_at": datetime.now(timezone.utc).isoformat(),
+                            "error": f"Error during agent execution: {str(e_stream)}",
+                            "done": True 
+                        }
+                        yield f'{json.dumps(error_response)}\n'
                 
                 print("[INFO] Ollama-compatible stream to client finished.")
 
