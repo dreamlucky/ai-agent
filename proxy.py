@@ -64,8 +64,6 @@ def generate():
 @app.route("/api/chat", methods=["POST"])
 def chat():
     data = request.get_json()
-    print("[DEBUG] OpenAI-style chat data:", data)
-
     messages = data.get("messages", [])
     model = data.get("model", "qwen3:30b-a3b")
     prompt = "\n".join([msg.get("content", "") for msg in messages])
@@ -76,33 +74,33 @@ def chat():
         "stream": True
     }
 
-    try:
-        upstream = requests.post(f"{OLLAMA_URL}/api/generate", json=ollama_payload, stream=True)
+    upstream = requests.post(f"{OLLAMA_URL}/api/generate", json=ollama_payload, stream=True)
 
-        @stream_with_context
-        def generate_stream():
-            # Initial assistant role message (OpenAI style)
-            yield json.dumps({"choices": [{"delta": {"role": "assistant"}}]}) + "\n"
+    def generate_stream():
+        # Initial assistant role (mimics OpenAI API)
+        yield json.dumps({"choices": [{"delta": {"role": "assistant"}}]}) + "\n"
 
-            for line in upstream.iter_lines():
-                if line:
-                    try:
-                        chunk = json.loads(line.decode("utf-8"))
-                        content = chunk.get("response", "")
-                        if content:
-                            yield json.dumps({"choices": [{"delta": {"content": content}}]}) + "\n"
-                    except Exception as e:
-                        print("[STREAM ERROR]", e)
+        for line in upstream.iter_lines():
+            if not line:
+                continue
+            decoded = line.decode("utf-8").strip()
 
-            # End of stream markers
-            yield json.dumps({"choices": [{"delta": {}}], "finish_reason": "stop"}) + "\n"
-            yield "[DONE]\n"
+            # Skip the '[DONE]' line to avoid JSON errors in Open WebUI
+            if decoded == "[DONE]":
+                continue
 
-        return Response(generate_stream(), mimetype='text/event-stream')
+            try:
+                parsed = json.loads(decoded)
+                content = parsed.get("response", "")
+                if content:
+                    yield json.dumps({"choices": [{"delta": {"content": content}}]}) + "\n"
+            except Exception as e:
+                print("[ERROR PARSING LINE]", decoded, e)
 
-    except Exception as e:
-        print("[ERROR]", e)
-        return jsonify({"error": str(e)}), 500
+        # Proper finish signal
+        yield json.dumps({"choices": [{"delta": {}}], "finish_reason": "stop"}) + "\n"
+
+    return Response(generate_stream(), mimetype='text/event-stream')
 
 
 
