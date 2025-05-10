@@ -79,11 +79,10 @@ def chat():
     try:
         upstream = requests.post(f"{OLLAMA_URL}/api/generate", json=ollama_payload, stream=True)
 
+        @stream_with_context
         def generate_stream():
-            # Send initial assistant role declaration
-            initial = {"choices": [{"delta": {"role": "assistant"}}]}
-            yield f'data: {json.dumps(initial)}\n\n'
-            print("[STREAM OUT] Initial:", initial)
+            # Initial assistant role message (OpenAI style)
+            yield json.dumps({"choices": [{"delta": {"role": "assistant"}}]}) + "\n"
 
             for line in upstream.iter_lines():
                 if line:
@@ -91,24 +90,20 @@ def chat():
                         chunk = json.loads(line.decode("utf-8"))
                         content = chunk.get("response", "")
                         if content:
-                            payload = {"choices": [{"delta": {"content": content}}]}
-                            print("[STREAM OUT] Chunk:", payload)
-                            yield f'data: {json.dumps(payload)}\n\n'
+                            yield json.dumps({"choices": [{"delta": {"content": content}}]}) + "\n"
                     except Exception as e:
                         print("[STREAM ERROR]", e)
 
-            # Signal end of stream
-            final = {"choices": [{"delta": {} }], "finish_reason": "stop"}
-            print("[STREAM OUT] Final:", final)
-            yield f'data: {json.dumps(final)}\n\n'
-            yield 'data: [DONE]\n\n'
+            # End of stream markers
+            yield json.dumps({"choices": [{"delta": {}}], "finish_reason": "stop"}) + "\n"
+            yield "[DONE]\n"
 
-        return Response(stream_with_context(generate_stream()), mimetype='text/event-stream')
+        return Response(generate_stream(), mimetype='text/event-stream')
 
     except Exception as e:
-        import traceback
-        traceback.print_exc()
+        print("[ERROR]", e)
         return jsonify({"error": str(e)}), 500
+
 
 
 @app.route("/api/tags", methods=["GET"])
