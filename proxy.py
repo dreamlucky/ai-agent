@@ -61,6 +61,14 @@ def generate():
         return jsonify({"error": str(e)}), 500
 
 
+from flask import Flask, request, Response, jsonify
+import requests
+import time
+import json
+
+app = Flask(__name__)
+OLLAMA_URL = "http://localhost:11434"
+
 @app.route("/api/chat", methods=["POST"])
 def chat():
     data = request.get_json()
@@ -69,52 +77,62 @@ def chat():
     stream = data.get("stream", False)
 
     prompt = "\n".join([msg.get("content", "") for msg in messages])
+
     ollama_payload = {
         "model": model,
         "prompt": prompt,
         "stream": stream
     }
 
-    upstream = requests.post(f"{OLLAMA_URL}/api/generate", json=ollama_payload, stream=stream)
+    try:
+        upstream = requests.post(
+            f"{OLLAMA_URL}/api/generate",
+            json=ollama_payload,
+            stream=stream,
+            timeout=300
+        )
 
-    if not stream:
-        # If not streaming, respond with JSON
-        response = upstream.json()
-        return jsonify({
-            "id": "ollama-chat",
-            "object": "chat.completion",
-            "choices": [{
-                "index": 0,
-                "message": {
-                    "role": "assistant",
-                    "content": response.get("response", "")
-                },
-                "finish_reason": "stop"
-            }],
-            "model": model,
-            "created": int(time.time())
-        })
+        if upstream.status_code != 200:
+            return jsonify({"error": f"Ollama error: {upstream.text}"}), upstream.status_code
 
-    def generate_stream():
-        yield json.dumps({"choices": [{"delta": {"role": "assistant"}}]}) + "\n"
+        if not stream:
+            raw = upstream.json()
+            return jsonify({
+                "id": "chatcmpl-ollama",
+                "object": "chat.completion",
+                "created": int(time.time()),
+                "model": model,
+                "choices": [{
+                    "index": 0,
+                    "message": {
+                        "role": "assistant",
+                        "content": raw.get("response", "")
+                    },
+                    "finish_reason": "stop"
+                }]
+            })
 
-        for line in upstream.iter_lines():
-            if not line:
-                continue
-            decoded = line.decode("utf-8").strip()
-            if decoded == "[DONE]":
-                continue
-            try:
-                parsed = json.loads(decoded)
-                content = parsed.get("response", "")
-                if content:
-                    yield json.dumps({"choices": [{"delta": {"content": content}}]}) + "\n"
-            except Exception as e:
-                print("[STREAM PARSE ERROR]", decoded, e)
+        def stream_response():
+            yield 'data: {"choices":[{"delta":{"role":"assistant"}}]}\n\n'
+            for line in upstream.iter_lines():
+                if not line:
+                    continue
+                decoded = line.decode("utf-8").strip()
+                if decoded == "[DONE]":
+                    continue
+                try:
+                    parsed = json.loads(decoded)
+                    content = parsed.get("response", "")
+                    if content:
+                        yield f'data: {json.dumps({"choices": [{"delta": {"content": content}}]})}\n\n'
+                except Exception as e:
+                    print("[STREAM PARSE ERROR]", decoded, e)
+            yield 'data: {"choices":[{"delta":{}}],"finish_reason":"stop"}\n\n'
 
-        yield json.dumps({"choices": [{"delta": {}}], "finish_reason": "stop"}) + "\n"
+        return Response(stream_response(), content_type="text/event-stream")
 
-    return Response(generate_stream(), mimetype='text/event-stream')
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
 
 
 @app.route("/api/tags", methods=["GET"])
