@@ -6,8 +6,7 @@ import traceback
 from flask import Flask, request, jsonify, Response, stream_with_context
 
 # LangChain imports
-# from langchain_community.llms import Ollama # Deprecated
-from langchain_ollama import OllamaLLM # CORRECTED OLLAMA IMPORT (directly import OllamaLLM)
+from langchain_ollama import OllamaLLM 
 from langchain.agents import AgentExecutor, create_react_agent
 from langchain_core.prompts import PromptTemplate
 from langchain.agents.output_parsers.react_json_single_input import ReActJsonSingleInputOutputParser
@@ -24,8 +23,8 @@ app = Flask(__name__)
 
 # --- Configuration ---
 OLLAMA_BASE_URL = os.getenv("OLLAMA_BACKEND", "http://localhost:11434") # Base URL for Ollama
-DEFAULT_MODEL = os.getenv("DEFAULT_MODEL", "llama3:latest") # Default model for the agent
-PROXY_VERSION = "0.3.4-langchain-ollamallm-import-fix" # Version of this proxy
+DEFAULT_MODEL = os.getenv("DEFAULT_MODEL", "qwen3:30b-a3b") # Default model for the agent - UPDATED
+PROXY_VERSION = "0.3.5-langchain-model-update" # Version of this proxy
 
 # --- LangChain Agent Setup ---
 # Initialize LLM
@@ -102,7 +101,7 @@ def chat_proxy_langchain():
         if not last_user_message:
             return jsonify({"error": "Empty or invalid user message content"}), 400
 
-        print(f"[INFO] LangChain Agent received query: {last_user_message}")
+        print(f"[INFO] LangChain Agent received query: {last_user_message} (Model: {DEFAULT_MODEL})") # Added model to log
 
         if stream:
             print("[WARN] Streaming with LangChain agent is experimental in this proxy.")
