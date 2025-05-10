@@ -1,73 +1,14 @@
 from flask import Flask, request, jsonify, Response, stream_with_context
-from tools.search import run_duckduckgo
 import requests
 import os
 import json
-
-app = Flask(__name__)
-
-OLLAMA_URL = os.getenv("OLLAMA_BACKEND", "http://192.168.1.8:11434")
-
-@app.route("/api/generate", methods=["POST"])
-def generate():
-    data = request.get_json()
-    print("[DEBUG] Direct generate data:", data)
-
-    user_prompt = data.get("prompt", "")
-    model = data.get("model", "qwen3:30b-a3b")
-    use_stream = data.get("stream", True)
-
-    # === AGENT TOOL LOGIC: Intercept search ===
-    if "search" in user_prompt.lower() or "look up" in user_prompt.lower():
-        query = user_prompt.lower().replace("search", "").replace("look up", "").strip()
-        results = run_duckduckgo(query)
-
-        if use_stream:
-            def stream_one_result():
-                yield f'data: {json.dumps({"response": results})}\n\n'
-                yield 'data: [DONE]\n\n'
-
-            return Response(stream_with_context(stream_one_result()), mimetype='text/event-stream')
-        else:
-            return jsonify({"response": results})
-
-    # === Streamed response ===
-    ollama_payload = {
-        "model": model,
-        "prompt": user_prompt,
-        "stream": use_stream
-    }
-
-    try:
-        upstream = requests.post(f"{OLLAMA_URL}/api/generate", json=ollama_payload, stream=use_stream)
-
-        if not use_stream:
-            return jsonify(upstream.json()), upstream.status_code
-
-        def stream_response():
-            for line in upstream.iter_lines():
-                if line:
-                    try:
-                        chunk = json.loads(line.decode("utf-8"))
-                        yield f'data: {json.dumps(chunk)}\n\n'
-                    except Exception as e:
-                        print("[STREAM ERROR]", e)
-
-        return Response(stream_with_context(stream_response()), mimetype='text/event-stream')
-
-    except Exception as e:
-        import traceback
-        traceback.print_exc()
-        return jsonify({"error": str(e)}), 500
-
-
-from flask import Flask, request, Response, jsonify
-import requests
 import time
-import json
+from tools.search import run_duckduckgo
 
 app = Flask(__name__)
-OLLAMA_URL = "http://localhost:11434"
+
+OLLAMA_URL = os.getenv("OLLAMA_BACKEND", "http://localhost:11434")
+
 
 @app.route("/api/chat", methods=["POST"])
 def chat():
@@ -77,6 +18,19 @@ def chat():
     stream = data.get("stream", False)
 
     prompt = "\n".join([msg.get("content", "") for msg in messages])
+
+    # DuckDuckGo intercept
+    if "search" in prompt.lower() or "look up" in prompt.lower():
+        query = prompt.lower().replace("search", "").replace("look up", "").strip()
+        results = run_duckduckgo(query)
+
+        if stream:
+            def stream_one_result():
+                yield f'data: {json.dumps({"response": results})}\n\n'
+                yield 'data: [DONE]\n\n'
+            return Response(stream_with_context(stream_one_result()), mimetype='text/event-stream')
+        else:
+            return jsonify({"response": results})
 
     ollama_payload = {
         "model": model,
@@ -93,24 +47,30 @@ def chat():
         )
 
         if upstream.status_code != 200:
+            print("[ERROR] Ollama returned error:", upstream.text)
             return jsonify({"error": f"Ollama error: {upstream.text}"}), upstream.status_code
 
         if not stream:
-            raw = upstream.json()
-            return jsonify({
-                "id": "chatcmpl-ollama",
-                "object": "chat.completion",
-                "created": int(time.time()),
-                "model": model,
-                "choices": [{
-                    "index": 0,
-                    "message": {
-                        "role": "assistant",
-                        "content": raw.get("response", "")
-                    },
-                    "finish_reason": "stop"
-                }]
-            })
+            try:
+                raw = upstream.json()
+                return jsonify({
+                    "id": "chatcmpl-ollama",
+                    "object": "chat.completion",
+                    "created": int(time.time()),
+                    "model": model,
+                    "choices": [{
+                        "index": 0,
+                        "message": {
+                            "role": "assistant",
+                            "content": raw.get("response", "")
+                        },
+                        "finish_reason": "stop"
+                    }]
+                })
+            except Exception as e:
+                print("[ERROR] Failed to parse non-streaming JSON:", e)
+                print("[DEBUG] Upstream raw:", upstream.text)
+                return jsonify({"error": "Invalid response from Ollama"}), 500
 
         def stream_response():
             yield 'data: {"choices":[{"delta":{"role":"assistant"}}]}\n\n'
@@ -119,7 +79,10 @@ def chat():
                     continue
                 decoded = line.decode("utf-8").strip()
                 if decoded == "[DONE]":
-                    continue
+                    yield 'data: {"choices":[{"delta":{}}],"finish_reason":"stop"}\n\n'
+                    break
+                if decoded.startswith("data: "):
+                    decoded = decoded[6:]
                 try:
                     parsed = json.loads(decoded)
                     content = parsed.get("response", "")
@@ -127,11 +90,12 @@ def chat():
                         yield f'data: {json.dumps({"choices": [{"delta": {"content": content}}]})}\n\n'
                 except Exception as e:
                     print("[STREAM PARSE ERROR]", decoded, e)
-            yield 'data: {"choices":[{"delta":{}}],"finish_reason":"stop"}\n\n'
 
         return Response(stream_response(), content_type="text/event-stream")
 
     except Exception as e:
+        import traceback
+        traceback.print_exc()
         return jsonify({"error": str(e)}), 500
 
 
@@ -139,11 +103,8 @@ def chat():
 def list_models():
     try:
         response = requests.get(f"{OLLAMA_URL}/api/tags")
-        print("[DEBUG] Ollama /api/tags response text:", response.text)
         return jsonify(response.json()), response.status_code
     except Exception as e:
-        import traceback
-        traceback.print_exc()
         print("[ERROR] /api/tags failed:", str(e))
         return jsonify({"error": str(e)}), 500
 
@@ -151,6 +112,7 @@ def list_models():
 @app.route("/api/version", methods=["GET"])
 def version():
     return jsonify({"version": "0.1.0"}), 200
+
 
 @app.route("/")
 def health():
