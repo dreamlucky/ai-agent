@@ -25,20 +25,20 @@ app = Flask(__name__)
 # --- Configuration ---
 OLLAMA_BASE_URL = os.getenv("OLLAMA_BACKEND", "http://localhost:11434") # Base URL for Ollama
 DEFAULT_MODEL = os.getenv("DEFAULT_MODEL", "qwen3:30b-a3b") # Default model for the agent
-PROXY_VERSION = "0.3.8-langchain-kwarg-fix" # Version of this proxy
+PROXY_VERSION = "0.3.9-langchain-stricter-prompt" # Version of this proxy
 
 # --- LangChain Agent Setup ---
 # Initialize LLM
 llm = OllamaLLM(base_url=OLLAMA_BASE_URL, model=DEFAULT_MODEL) 
 
 # Define a ReAct prompt template for the agent.
-# This version is more explicit about the JSON output for actions.
+# This version is more explicit about the JSON output for actions and no-tool responses.
 react_prompt_template_str = """
 Answer the following questions as best you can. You have access to the following tools:
 
 {tools}
 
-To use a tool, please use the following JSON format:
+To use a tool, please use the following JSON format exactly:
 ```json
 {{
   "action": "tool name (must be one of [{tool_names}])",
@@ -47,10 +47,13 @@ To use a tool, please use the following JSON format:
 ```
 After receiving the observation from the tool, continue with your thought process.
 
-If you have the final answer, use the following format:
+If no tool is needed to answer the question, or if you have gathered enough information, provide your answer directly using the following format:
 Final Answer: [your final answer here]
 
-You MUST use this format. Do not output XML-like tags such as <think>.
+IMPORTANT: 
+- Only use the JSON format for tool actions.
+- For direct answers (when no tool is used or after tool use), ONLY use the "Final Answer:" format.
+- Do NOT output any XML-like tags such as <think> or <thought> at any point. Stick strictly to the formats described.
 
 Let's begin!
 
@@ -74,9 +77,7 @@ if agent_tools:
         agent=agent,
         tools=agent_tools,
         verbose=True,
-        # handle_parsing_errors=True, # This was the first instance
         max_iterations=10,
-        # Corrected: Only one instance of handle_parsing_errors
         handle_parsing_errors="Check your output and make sure it conforms to the expected JSON format for actions or 'Final Answer: ...' for answers." 
     )
 else:
@@ -161,13 +162,13 @@ def chat_proxy_langchain():
                         if is_done_in_this_chunk:
                             break 
 
-                    if not is_done_in_this_chunk:
+                    if not is_done_in_this_chunk: # If loop finished but done was not explicitly set true
                         ollama_final_chunk = {
                             "model": DEFAULT_MODEL,
                             "created_at": datetime.now(timezone.utc).isoformat(),
                             "message": {
                                 "role": "assistant",
-                                "content": "" 
+                                "content": "" # Content should have been streamed; this is just the done signal
                             },
                             "done": True,
                         }
