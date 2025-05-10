@@ -66,42 +66,55 @@ def chat():
     data = request.get_json()
     messages = data.get("messages", [])
     model = data.get("model", "qwen3:30b-a3b")
-    prompt = "\n".join([msg.get("content", "") for msg in messages])
+    stream = data.get("stream", False)
 
+    prompt = "\n".join([msg.get("content", "") for msg in messages])
     ollama_payload = {
         "model": model,
         "prompt": prompt,
-        "stream": True
+        "stream": stream
     }
 
-    upstream = requests.post(f"{OLLAMA_URL}/api/generate", json=ollama_payload, stream=True)
+    upstream = requests.post(f"{OLLAMA_URL}/api/generate", json=ollama_payload, stream=stream)
+
+    if not stream:
+        # If not streaming, respond with JSON
+        response = upstream.json()
+        return jsonify({
+            "id": "ollama-chat",
+            "object": "chat.completion",
+            "choices": [{
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "content": response.get("response", "")
+                },
+                "finish_reason": "stop"
+            }],
+            "model": model,
+            "created": int(time.time())
+        })
 
     def generate_stream():
-        # Initial assistant role (mimics OpenAI API)
         yield json.dumps({"choices": [{"delta": {"role": "assistant"}}]}) + "\n"
 
         for line in upstream.iter_lines():
             if not line:
                 continue
             decoded = line.decode("utf-8").strip()
-
-            # Skip the '[DONE]' line to avoid JSON errors in Open WebUI
             if decoded == "[DONE]":
                 continue
-
             try:
                 parsed = json.loads(decoded)
                 content = parsed.get("response", "")
                 if content:
                     yield json.dumps({"choices": [{"delta": {"content": content}}]}) + "\n"
             except Exception as e:
-                print("[ERROR PARSING LINE]", decoded, e)
+                print("[STREAM PARSE ERROR]", decoded, e)
 
-        # Proper finish signal
         yield json.dumps({"choices": [{"delta": {}}], "finish_reason": "stop"}) + "\n"
 
     return Response(generate_stream(), mimetype='text/event-stream')
-
 
 
 @app.route("/api/tags", methods=["GET"])
