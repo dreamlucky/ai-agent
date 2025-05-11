@@ -9,8 +9,9 @@ from datetime import datetime, timezone
 # LangChain imports
 from langchain_ollama import OllamaLLM 
 from langchain.agents import AgentExecutor, create_react_agent
-from langchain_core.prompts import PromptTemplate
+from langchain_core.prompts import PromptTemplate 
 from langchain.agents.output_parsers.react_json_single_input import ReActJsonSingleInputOutputParser
+# from langchain_core.messages import AIMessage, HumanMessage # Not strictly needed for current history string format
 
 # Import your tools from tools.custom_tools
 try:
@@ -25,16 +26,20 @@ app = Flask(__name__)
 # --- Configuration ---
 OLLAMA_BASE_URL = os.getenv("OLLAMA_BACKEND", "http://localhost:11434") # Base URL for Ollama
 DEFAULT_MODEL = os.getenv("DEFAULT_MODEL", "qwen3:30b-a3b") # Default model for the agent
-PROXY_VERSION = "0.4.0-langchain-stream-refine" # Version of this proxy
+PROXY_VERSION = "0.5.1-langchain-enhanced-memory-prompt" # Version of this proxy
+MEMORY_WINDOW_SIZE = os.getenv("MEMORY_WINDOW_SIZE", "5") # Number of past interactions (user + AI)
 
 # --- LangChain Agent Setup ---
 # Initialize LLM
 llm = OllamaLLM(base_url=OLLAMA_BASE_URL, model=DEFAULT_MODEL) 
 
-# Define a ReAct prompt template for the agent.
+# Define a ReAct prompt template for the agent, now with more explicit history instructions.
 react_prompt_template_str = """
-Answer the following questions as best you can. You have access to the following tools:
+You are a helpful assistant. Your primary goal is to answer the user's NEW INPUT.
+Before answering, CAREFULLY REVIEW the PREVIOUS CONVERSATION below to understand the context, especially if the NEW INPUT seems to be a follow-up question.
+Use the PREVIOUS CONVERSATION to inform your response to the NEW INPUT.
 
+You have access to the following tools:
 {tools}
 
 To use a tool, please use the following JSON format exactly:
@@ -44,31 +49,37 @@ To use a tool, please use the following JSON format exactly:
   "action_input": "the input to the tool"
 }}
 ```
-After receiving the observation from the tool, continue with your thought process.
+After receiving the observation from the tool, continue with your thought process, remembering the PREVIOUS CONVERSATION and the NEW INPUT.
 
-If no tool is needed to answer the question, or if you have gathered enough information, provide your answer directly using the following format:
+If no tool is needed to answer the NEW INPUT, or if you have gathered enough information (from tools or PREVIOUS CONVERSATION), provide your answer directly using the following format:
 Final Answer: [your final answer here]
 
 IMPORTANT: 
 - Only use the JSON format for tool actions.
-- For direct answers (when no tool is used or after tool use), ONLY use the "Final Answer:" format.
+- For direct answers, ONLY use the "Final Answer:" format.
 - Do NOT output any XML-like tags such as <think> or <thought> at any point. Stick strictly to the formats described.
 
-Let's begin!
+PREVIOUS CONVERSATION:
+{chat_history}
 
+NEW INPUT:
 Question: {input}
+
+Now, begin your thought process.
 Thought: {agent_scratchpad}
 """
 
-
-agent_prompt = PromptTemplate.from_template(react_prompt_template_str)
+agent_prompt = PromptTemplate.from_template(react_prompt_template_str).partial(
+    tools="\n".join([f"{tool.name}: {tool.description}" for tool in agent_tools]),
+    tool_names=", ".join([tool.name for tool in agent_tools]),
+)
 
 # Create the ReAct agent
 if agent_tools: 
     agent = create_react_agent(
         llm=llm,
         tools=agent_tools,
-        prompt=agent_prompt,
+        prompt=agent_prompt, 
         output_parser=ReActJsonSingleInputOutputParser()
     )
 
@@ -77,7 +88,7 @@ if agent_tools:
         tools=agent_tools,
         verbose=True,
         max_iterations=10,
-        handle_parsing_errors="Check your output and make sure it conforms to the expected JSON format for actions or 'Final Answer: ...' for answers." 
+        handle_parsing_errors="Parsing Error: Check your output and make sure it conforms to the expected JSON format for actions or 'Final Answer: ...' for answers. Do not use XML-like tags."
     )
 else:
     agent_executor = None 
@@ -95,74 +106,90 @@ def chat_proxy_langchain():
         if not data:
             return jsonify({"error": "Invalid JSON payload"}), 400
 
-        messages = data.get("messages", [])
+        all_messages_from_request = data.get("messages", [])
         stream = data.get("stream", False) 
 
-        if not messages:
+        if not all_messages_from_request:
             return jsonify({"error": "Missing 'messages' field"}), 400
 
-        last_user_message = ""
-        if messages and isinstance(messages, list) and len(messages) > 0:
-            last_user_message = messages[-1].get("content", "")
-        
-        if not last_user_message:
-            return jsonify({"error": "Empty or invalid user message content"}), 400
+        last_user_message_content = all_messages_from_request[-1].get("content", "")
+        if not last_user_message_content:
+            return jsonify({"error": "Empty user message content"}), 400
 
-        print(f"[INFO] LangChain Agent received query: {last_user_message} (Model: {DEFAULT_MODEL}, Stream: {stream})")
+        chat_history_for_prompt = []
+        history_messages_to_consider = all_messages_from_request[:-1] 
+        
+        try:
+            window_size = int(MEMORY_WINDOW_SIZE)
+        except ValueError:
+            print(f"[WARN] Invalid MEMORY_WINDOW_SIZE value: '{MEMORY_WINDOW_SIZE}'. Defaulting to 5.")
+            window_size = 5
+            
+        start_index = max(0, len(history_messages_to_consider) - (window_size * 2))
+        relevant_history = history_messages_to_consider[start_index:]
+
+        for msg in relevant_history:
+            role = msg.get("role", "user")
+            content = msg.get("content", "")
+            if role == "user":
+                chat_history_for_prompt.append(f"Human: {content}")
+            elif role == "assistant": # Also consider 'ai' or other assistant roles if OpenWebUI uses them
+                chat_history_for_prompt.append(f"AI: {content}")
+        
+        chat_history_str = "\n".join(chat_history_for_prompt)
+        if not chat_history_str: # Handle case of no prior history
+            chat_history_str = "No previous conversation."
+
+
+        print(f"[INFO] LangChain Agent received query: '{last_user_message_content}' (Model: {DEFAULT_MODEL}, Stream: {stream})")
+        if relevant_history: # Only print if there's actual history being passed
+            print(f"[DEBUG] Passing chat history to agent:\n{chat_history_str}")
+        else:
+            print("[DEBUG] No prior chat history being passed to agent for this turn.")
+
+
+        agent_input = {
+            "input": last_user_message_content,
+            "chat_history": chat_history_str 
+        }
+
 
         if stream:
             print("[INFO] Handling stream request for /api/chat in Ollama-compatible format.")
             
             def generate_ollama_compatible_stream():
-                accumulated_final_output = "" # To keep track of what part of the final answer has been sent
-                is_done_sent = False # Flag to ensure 'done:true' is sent only once at the very end
-
+                accumulated_final_output = "" 
+                is_done_sent = False 
                 try:
-                    # Iterate over the LangChain agent's stream
-                    for event_chunk in agent_executor.stream({"input": last_user_message}):
-                        # The 'output' key in event_chunk usually contains the agent's final answer
-                        # or significant intermediate results that are meant to be part of the final answer.
+                    for event_chunk in agent_executor.stream(agent_input): 
+                        new_content_to_stream = ""
+                        
                         if "output" in event_chunk and event_chunk["output"] is not None:
                             full_chunk_output = event_chunk["output"]
-                            
-                            # Determine the new part of the content to stream
-                            # This handles cases where 'output' might be cumulative or repeated
-                            new_content_to_stream = ""
                             if full_chunk_output.startswith(accumulated_final_output):
                                 new_content_to_stream = full_chunk_output[len(accumulated_final_output):]
                             else:
-                                # If it doesn't start with accumulated, it might be a fresh/replaced output
                                 new_content_to_stream = full_chunk_output
-                                accumulated_final_output = "" # Reset accumulated if output is not a continuation
-
-                            if new_content_to_stream:
+                                accumulated_final_output = "" 
+                            
+                            if new_content_to_stream: 
                                 accumulated_final_output += new_content_to_stream
-                                ollama_chunk = {
-                                    "model": DEFAULT_MODEL,
-                                    "created_at": datetime.now(timezone.utc).isoformat(),
-                                    "message": {
-                                        "role": "assistant",
-                                        "content": new_content_to_stream 
-                                    },
-                                    "done": False # Not done yet, more might come or a final 'done' chunk
-                                }
-                                print(f"[DEBUG] Streaming chunk: {json.dumps(ollama_chunk)}")
-                                yield f'{json.dumps(ollama_chunk)}\n'
+                            
+                        if new_content_to_stream:
+                            ollama_chunk = {
+                                "model": DEFAULT_MODEL,
+                                "created_at": datetime.now(timezone.utc).isoformat(),
+                                "message": { "role": "assistant", "content": new_content_to_stream },
+                                "done": False 
+                            }
+                            print(f"[DEBUG] Streaming chunk: {json.dumps(ollama_chunk)}")
+                            yield f'{json.dumps(ollama_chunk)}\n'
                         
-                        # You can add more sophisticated logic here to inspect other parts of event_chunk
-                        # if you want to stream intermediate thoughts, but for now, we focus on 'output'.
-                        # For example, if 'messages' contains AIMessageChunk, you might stream its content.
-                        # However, be careful not to duplicate content already handled by 'output'.
-
-                    # After the loop, send the final 'done: true' message
                     if not is_done_sent:
                         final_done_chunk = {
                             "model": DEFAULT_MODEL,
                             "created_at": datetime.now(timezone.utc).isoformat(),
-                            "message": {
-                                "role": "assistant",
-                                "content": "" # No new content, just signaling completion
-                            },
+                            "message": { "role": "assistant", "content": "" }, 
                             "done": True,
                         }
                         print(f"[DEBUG] Streaming final done chunk: {json.dumps(final_done_chunk)}")
@@ -172,7 +199,7 @@ def chat_proxy_langchain():
                 except Exception as e_stream:
                     print(f"[ERROR] Error during agent stream generation: {e_stream}")
                     traceback.print_exc()
-                    if not is_done_sent: # Ensure done is sent even on error
+                    if not is_done_sent: 
                         error_response = {
                             "model": DEFAULT_MODEL,
                             "created_at": datetime.now(timezone.utc).isoformat(),
@@ -187,16 +214,13 @@ def chat_proxy_langchain():
         
         else: # Non-streaming response
             print("[INFO] Handling non-stream request for /api/chat in Ollama-compatible format.")
-            response_payload = agent_executor.invoke({"input": last_user_message})
+            response_payload = agent_executor.invoke(agent_input) 
             agent_final_answer = response_payload.get("output", "Sorry, I could not process your request effectively.")
 
             ollama_response = {
                 "model": DEFAULT_MODEL,
                 "created_at": datetime.now(timezone.utc).isoformat(),
-                "message": {
-                    "role": "assistant",
-                    "content": agent_final_answer
-                },
+                "message": { "role": "assistant", "content": agent_final_answer },
                 "done": True,
             }
             return jsonify(ollama_response)
@@ -246,6 +270,7 @@ if __name__ == "__main__":
     print(f"Version: {PROXY_VERSION}")
     print(f"Targeting Ollama at: {OLLAMA_BASE_URL}")
     print(f"Default model for agent: {DEFAULT_MODEL}")
+    print(f"Memory window size (interactions): {MEMORY_WINDOW_SIZE}")
     if agent_executor:
         print(f"Agent initialized with tools: {[tool.name for tool in agent_tools]}")
     else:
