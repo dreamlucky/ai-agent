@@ -3,9 +3,20 @@ services:
     build: .
     container_name: ai-agent
     ports:
-      - "11435:5000"  # Maps proxy to host
+      - "11435:5000"
+    volumes:
+      # This single mapped volume will contain subdirectories for SQLite and Chroma
+      - /mnt/ai/data/ai-agent:/app/persistent_data # Host path : Container path
+      # Your existing volume mounts like /mnt/ai/data:/data can remain if used for other things
     environment:
       - OLLAMA_BACKEND=http://192.168.1.8:11434
+      - DEFAULT_MODEL=qwen3:30b-a3b
+      - OPENAI_API_KEY=your_openai_api_key_here # If using the OpenAI tool
+      - MEMORY_WINDOW_SIZE=5
+      # --- New Environment Variables for RAG ---
+      - SQLITE_DB_PATH=/app/persistent_data/chat_history.db
+      - VECTOR_STORE_PATH=/app/persistent_data/vector_store/chroma_db
+      - EMBEDDING_MODEL_NAME=all-MiniLM-L6-v2
     restart: unless-stopped
 
   openwebui:
@@ -18,5 +29,5 @@ services:
     environment:
       - OLLAMA_API_BASE_URL=http://ai-agent:5000
     volumes:
-      - /mnt/ai/openwebui:/app/backend/data
+      - /mnt/ai/data/openwebui:/app/backend/data
     restart: unless-stopped

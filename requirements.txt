@@ -1,30 +1,27 @@
-# LangChain + Ollama
+# === Core Web Server and HTTP Handling ===
+flask
+requests
+
+# === LangChain & LLM Integration ===
 langchain
 langchain-community
-openai  # Needed for some LangChain internals
-ollama
 langchain-ollama
+ollama
+openai  # Optional: Required only if using OpenAI models
 
-# Web Search
+# === Search & Scraping Tools ===
 duckduckgo-search
-
-# Web scraping and HTML parsing
-requests
 beautifulsoup4
-playwright
 
-# PDF parsing
-PyPDF2
+# === RAG (Retrieval-Augmented Generation) Support ===
+chromadb>=0.4.22       # Preferred vector store
+sentence-transformers>=2.2.0  # Embedding models for document search
 
-# For structured agent tools / CLI
-tqdm
-python-dotenv
+# === Vector Store Alternatives ===
+# faiss-cpu            # Optional: Use only if switching from ChromaDB
 
-# Optional: persistent memory / vector store (you can expand later)
-faiss-cpu
+# === PDF & File Utilities ===
+# PyPDF2               # Optional: Needed if handling PDF ingestion
 
-#proxy
-flask
-
-# Required for Playwright installation (only needed once)
-# You should also run: playwright install
+# === Notes ===
+# sqlite3 is built into Python, no need to list it here explicitly.
