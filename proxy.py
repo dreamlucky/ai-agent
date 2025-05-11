@@ -31,7 +31,7 @@ app = Flask(__name__)
 # --- Configuration ---
 OLLAMA_BASE_URL = os.getenv("OLLAMA_BACKEND", "http://localhost:11434")
 DEFAULT_MODEL = os.getenv("DEFAULT_MODEL", "qwen3:30b-a3b")
-PROXY_VERSION = "0.6.5-rag-db-file-check" # Version of this proxy
+PROXY_VERSION = "0.6.6-rag-db-pre-check" # Version of this proxy
 MEMORY_WINDOW_SIZE = os.getenv("MEMORY_WINDOW_SIZE", "5")
 
 # --- RAG Configuration ---
@@ -46,14 +46,34 @@ def init_sqlite_db():
     """Initializes the SQLite database and creates the chat_history table if it doesn't exist."""
     db_dir = os.path.dirname(SQLITE_DB_PATH)
     if not os.path.exists(db_dir):
-        os.makedirs(db_dir, exist_ok=True)
-        print(f"[INFO] Created directory for SQLite DB: {db_dir}")
-    
-    conn = None # Initialize conn to None
+        try:
+            os.makedirs(db_dir, exist_ok=True)
+            print(f"[INFO] Created directory for SQLite DB: {db_dir}")
+        except OSError as e:
+            print(f"[ERROR] Failed to create directory {db_dir}: {e}")
+            traceback.print_exc()
+            return # Stop if directory creation fails
+
+    # Check if DB file exists *before* trying to connect or create
+    if os.path.exists(SQLITE_DB_PATH):
+        print(f"[DEBUG] Pre-check: SQLite DB file '{SQLITE_DB_PATH}' ALREADY EXISTS before connect attempt.")
+    else:
+        print(f"[DEBUG] Pre-check: SQLite DB file '{SQLITE_DB_PATH}' DOES NOT EXIST before connect attempt. Will be created by connect().")
+
+    conn = None 
     try:
-        conn = sqlite3.connect(SQLITE_DB_PATH)
+        conn = sqlite3.connect(SQLITE_DB_PATH) # This will create the file if it doesn't exist
         cursor = conn.cursor()
-        # Added user_id column to chat_history table
+        
+        # Check if the table already exists and what its schema is (for debugging)
+        cursor.execute("SELECT sql FROM sqlite_master WHERE type='table' AND name='chat_history';")
+        existing_table_schema = cursor.fetchone()
+        if existing_table_schema:
+            print(f"[DEBUG] Existing 'chat_history' table schema: {existing_table_schema[0]}")
+        else:
+            print("[DEBUG] 'chat_history' table does not exist yet. Will be created.")
+
+        # Create table if it doesn't exist with the correct schema
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS chat_history (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -67,7 +87,7 @@ def init_sqlite_db():
             )
         """)
         conn.commit()
-        print(f"[INFO] SQLite DB for chat history initialized at {SQLITE_DB_PATH}")
+        print(f"[INFO] SQLite DB for chat history initialized/verified at {SQLITE_DB_PATH}")
     except sqlite3.Error as e:
         print(f"[ERROR] SQLite initialization error: {e}")
         traceback.print_exc()
@@ -90,9 +110,10 @@ except Exception as e:
 chroma_client = None
 collection = None
 try:
-    if not os.path.exists(VECTOR_STORE_PATH):
-        os.makedirs(VECTOR_STORE_PATH, exist_ok=True)
-        print(f"[INFO] Created directory for Chroma vector store: {VECTOR_STORE_PATH}")
+    vector_store_dir = os.path.dirname(VECTOR_STORE_PATH) # Get directory for Chroma path
+    if not os.path.exists(vector_store_dir): # Ensure parent directory exists
+        os.makedirs(vector_store_dir, exist_ok=True)
+        print(f"[INFO] Created directory for Chroma vector store parent: {vector_store_dir}")
 
     print(f"[INFO] Initializing ChromaDB persistent client at: {VECTOR_STORE_PATH}")
     chroma_client = chromadb.PersistentClient(path=VECTOR_STORE_PATH)
@@ -110,26 +131,31 @@ init_sqlite_db()
 
 # --- Add this check right after calling init_sqlite_db() ---
 if os.path.exists(SQLITE_DB_PATH):
-    print(f"[DEBUG] SQLite DB file check: File '{SQLITE_DB_PATH}' EXISTS after initialization (from Python's perspective).")
+    print(f"[DEBUG] Post-init check: File '{SQLITE_DB_PATH}' EXISTS (from Python's perspective).")
     try:
-        # Try a simple read operation to confirm it's a valid DB
         conn_check = sqlite3.connect(SQLITE_DB_PATH)
         cursor_check = conn_check.cursor()
-        cursor_check.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='chat_history';")
-        table_exists = cursor_check.fetchone()
-        if table_exists:
-            print(f"[DEBUG] SQLite DB file check: 'chat_history' table EXISTS in '{SQLITE_DB_PATH}'.")
+        cursor_check.execute("PRAGMA table_info(chat_history);") # Get column info
+        columns = cursor_check.fetchall()
+        if columns:
+            column_names = [col[1] for col in columns]
+            print(f"[DEBUG] Post-init check: 'chat_history' table columns: {column_names}")
+            if "user_id" in column_names:
+                print(f"[DEBUG] Post-init check: 'user_id' column EXISTS in 'chat_history' table.")
+            else:
+                print(f"[WARN] Post-init check: 'user_id' column DOES NOT EXIST in 'chat_history' table.")
         else:
-            print(f"[WARN] SQLite DB file check: 'chat_history' table DOES NOT EXIST in '{SQLITE_DB_PATH}'.")
+            print(f"[WARN] Post-init check: 'chat_history' table IS EMPTY or DOES NOT EXIST in '{SQLITE_DB_PATH}'.")
         conn_check.close()
     except sqlite3.Error as e_check:
-        print(f"[WARN] SQLite DB file check: Error accessing '{SQLITE_DB_PATH}' after creation: {e_check}")
+        print(f"[WARN] Post-init check: Error accessing '{SQLITE_DB_PATH}': {e_check}")
 else:
-    print(f"[WARN] SQLite DB file check: File '{SQLITE_DB_PATH}' DOES NOT EXIST after initialization (from Python's perspective).")
+    print(f"[WARN] Post-init check: File '{SQLITE_DB_PATH}' DOES NOT EXIST (from Python's perspective).")
 # --- End of new check ---
 
 
 # --- LangChain Agent Setup ---
+# (The rest of the file remains the same as version 0.6.4)
 llm = OllamaLLM(base_url=OLLAMA_BASE_URL, model=DEFAULT_MODEL) 
 
 react_prompt_template_str = """
@@ -186,14 +212,12 @@ else:
     print("[WARN] LangChain Agent Executor not initialized because tools could not be loaded.")
 
 # --- RAG Helper Functions ---
-# (add_interaction_to_db, add_interaction_to_vector_store, retrieve_relevant_history remain the same as v0.6.4)
 def add_interaction_to_db(user_id: str, conversation_id: str, turn_id: int, role: str, content: str, metadata: dict = None):
     """Adds a chat interaction to the SQLite database, now including user_id."""
     if not SQLITE_DB_PATH: print("[WARN] SQLITE_DB_PATH not set. Skipping DB log."); return
     try:
         with sqlite3.connect(SQLITE_DB_PATH) as conn:
             cursor = conn.cursor()
-            # Add user_id to the insert statement
             cursor.execute(
                 "INSERT INTO chat_history (user_id, conversation_id, turn_id, role, content, metadata) VALUES (?, ?, ?, ?, ?, ?)",
                 (user_id, conversation_id, turn_id, role, content, json.dumps(metadata) if metadata else None)
@@ -261,7 +285,6 @@ def retrieve_relevant_history(query_text: str, user_id: str, n_results: int = RA
         return "Error retrieving from your long-term memory."
 
 # --- Flask Routes ---
-# (Flask routes remain the same as v0.6.4, ensuring user_id is handled and passed to RAG functions)
 @app.route("/api/chat", methods=["POST"])
 def chat_proxy_langchain():
     if not agent_executor: return jsonify({"error": "LangChain agent is not available."}), 503
