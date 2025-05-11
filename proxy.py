@@ -31,7 +31,7 @@ app = Flask(__name__)
 # --- Configuration ---
 OLLAMA_BASE_URL = os.getenv("OLLAMA_BACKEND", "http://localhost:11434")
 DEFAULT_MODEL = os.getenv("DEFAULT_MODEL", "qwen3:30b-a3b")
-PROXY_VERSION = "0.6.4-rag-user-scope" # Version of this proxy
+PROXY_VERSION = "0.6.5-rag-db-file-check" # Version of this proxy
 MEMORY_WINDOW_SIZE = os.getenv("MEMORY_WINDOW_SIZE", "5")
 
 # --- RAG Configuration ---
@@ -48,24 +48,32 @@ def init_sqlite_db():
     if not os.path.exists(db_dir):
         os.makedirs(db_dir, exist_ok=True)
         print(f"[INFO] Created directory for SQLite DB: {db_dir}")
-    conn = sqlite3.connect(SQLITE_DB_PATH)
-    cursor = conn.cursor()
-    # Added user_id column to chat_history table
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS chat_history (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id TEXT NOT NULL, 
-            conversation_id TEXT NOT NULL,
-            turn_id INTEGER NOT NULL,
-            role TEXT NOT NULL CHECK(role IN ('user', 'assistant')),
-            content TEXT NOT NULL,
-            timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
-            metadata TEXT 
-        )
-    """)
-    conn.commit()
-    conn.close()
-    print(f"[INFO] SQLite DB for chat history initialized at {SQLITE_DB_PATH}")
+    
+    conn = None # Initialize conn to None
+    try:
+        conn = sqlite3.connect(SQLITE_DB_PATH)
+        cursor = conn.cursor()
+        # Added user_id column to chat_history table
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS chat_history (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id TEXT NOT NULL, 
+                conversation_id TEXT NOT NULL,
+                turn_id INTEGER NOT NULL,
+                role TEXT NOT NULL CHECK(role IN ('user', 'assistant')),
+                content TEXT NOT NULL,
+                timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
+                metadata TEXT 
+            )
+        """)
+        conn.commit()
+        print(f"[INFO] SQLite DB for chat history initialized at {SQLITE_DB_PATH}")
+    except sqlite3.Error as e:
+        print(f"[ERROR] SQLite initialization error: {e}")
+        traceback.print_exc()
+    finally:
+        if conn:
+            conn.close()
 
 # 2. Embedding Model
 embedding_model = None
@@ -89,7 +97,7 @@ try:
     print(f"[INFO] Initializing ChromaDB persistent client at: {VECTOR_STORE_PATH}")
     chroma_client = chromadb.PersistentClient(path=VECTOR_STORE_PATH)
     
-    COLLECTION_NAME = "user_chat_interactions" # Collection name implying user-specific data potential
+    COLLECTION_NAME = "user_chat_interactions" 
     print(f"[INFO] Getting or creating Chroma collection: {COLLECTION_NAME}")
     collection = chroma_client.get_or_create_collection(name=COLLECTION_NAME) 
     print(f"[INFO] ChromaDB client and collection '{COLLECTION_NAME}' initialized.")
@@ -99,6 +107,27 @@ except Exception as e:
 
 # Call initialization functions at startup
 init_sqlite_db()
+
+# --- Add this check right after calling init_sqlite_db() ---
+if os.path.exists(SQLITE_DB_PATH):
+    print(f"[DEBUG] SQLite DB file check: File '{SQLITE_DB_PATH}' EXISTS after initialization (from Python's perspective).")
+    try:
+        # Try a simple read operation to confirm it's a valid DB
+        conn_check = sqlite3.connect(SQLITE_DB_PATH)
+        cursor_check = conn_check.cursor()
+        cursor_check.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='chat_history';")
+        table_exists = cursor_check.fetchone()
+        if table_exists:
+            print(f"[DEBUG] SQLite DB file check: 'chat_history' table EXISTS in '{SQLITE_DB_PATH}'.")
+        else:
+            print(f"[WARN] SQLite DB file check: 'chat_history' table DOES NOT EXIST in '{SQLITE_DB_PATH}'.")
+        conn_check.close()
+    except sqlite3.Error as e_check:
+        print(f"[WARN] SQLite DB file check: Error accessing '{SQLITE_DB_PATH}' after creation: {e_check}")
+else:
+    print(f"[WARN] SQLite DB file check: File '{SQLITE_DB_PATH}' DOES NOT EXIST after initialization (from Python's perspective).")
+# --- End of new check ---
+
 
 # --- LangChain Agent Setup ---
 llm = OllamaLLM(base_url=OLLAMA_BASE_URL, model=DEFAULT_MODEL) 
@@ -157,6 +186,7 @@ else:
     print("[WARN] LangChain Agent Executor not initialized because tools could not be loaded.")
 
 # --- RAG Helper Functions ---
+# (add_interaction_to_db, add_interaction_to_vector_store, retrieve_relevant_history remain the same as v0.6.4)
 def add_interaction_to_db(user_id: str, conversation_id: str, turn_id: int, role: str, content: str, metadata: dict = None):
     """Adds a chat interaction to the SQLite database, now including user_id."""
     if not SQLITE_DB_PATH: print("[WARN] SQLITE_DB_PATH not set. Skipping DB log."); return
@@ -176,9 +206,8 @@ def add_interaction_to_vector_store(doc_id: str, text_content: str, user_id: str
     if not collection or not embedding_model:
         print("[WARN] Vector store or embedding model not initialized. Skipping vector store add."); return
     
-    # Ensure metadata is a dict and includes user_id
     if metadata is None: metadata = {}
-    metadata["user_id"] = user_id # Crucial for filtering
+    metadata["user_id"] = user_id 
 
     try:
         print(f"[DEBUG] Embedding document ID: {doc_id} for vector store. Metadata: {metadata}")
@@ -203,13 +232,13 @@ def retrieve_relevant_history(query_text: str, user_id: str, n_results: int = RA
         print(f"[DEBUG] Generating query embedding for user '{user_id}', query: '{query_text[:50]}...'")
         query_embedding = embedding_model.embed_query(query_text) 
         
-        where_filter = {"user_id": user_id} # Filter by user_id
+        where_filter = {"user_id": user_id} 
         
         print(f"[DEBUG] Querying vector store for user '{user_id}'. N_results={n_results}, Filter: {where_filter}")
         results = collection.query(
             query_embeddings=[query_embedding], 
             n_results=n_results, 
-            where=where_filter, # Apply the user_id filter
+            where=where_filter, 
             include=['documents', 'metadatas'] 
         )
         
@@ -218,7 +247,6 @@ def retrieve_relevant_history(query_text: str, user_id: str, n_results: int = RA
             for i, doc_text in enumerate(results['documents'][0]):
                 doc_metadata = results['metadatas'][0][i] if results.get('metadatas') and results['metadatas'][0] and i < len(results['metadatas'][0]) else {}
                 original_conv_id = doc_metadata.get('conversation_id', 'unknown_conv')
-                # Clarify that this context is from the current user's history
                 retrieved_docs_texts.append(f"Retrieved context (from your past conv: {original_conv_id}): {doc_text}")
             if retrieved_docs_texts:
                 print(f"[INFO] Retrieved {len(retrieved_docs_texts)} relevant documents from vector store for user {user_id}.")
@@ -233,6 +261,7 @@ def retrieve_relevant_history(query_text: str, user_id: str, n_results: int = RA
         return "Error retrieving from your long-term memory."
 
 # --- Flask Routes ---
+# (Flask routes remain the same as v0.6.4, ensuring user_id is handled and passed to RAG functions)
 @app.route("/api/chat", methods=["POST"])
 def chat_proxy_langchain():
     if not agent_executor: return jsonify({"error": "LangChain agent is not available."}), 503
@@ -243,14 +272,7 @@ def chat_proxy_langchain():
         all_messages_from_request = data.get("messages", [])
         stream = data.get("stream", False) 
         
-        # --- User ID Handling ---
-        # This is a placeholder. In a real multi-user app, OpenWebUI (or an auth layer)
-        # would need to send a reliable user_id.
-        # For now, we'll try to get it from a hypothetical 'X-User-ID' header or default.
         user_id = request.headers.get("X-User-ID", "default_user") 
-        # You could also try to get it from data payload if OpenWebUI sends it there:
-        # user_id_from_payload = data.get("user_id") 
-        # if user_id_from_payload: user_id = user_id_from_payload
         print(f"[INFO] Using user_id: {user_id}")
 
         conversation_id = data.get("conversation_id")
@@ -259,7 +281,7 @@ def chat_proxy_langchain():
         if not conversation_id and "chat_id" in data: 
             conversation_id = data["chat_id"]
         if not conversation_id:
-            conversation_id = f"session_{user_id}_{int(time.time())}_{os.urandom(4).hex()}" # Include user_id in generated conv_id
+            conversation_id = f"session_{user_id}_{int(time.time())}_{os.urandom(4).hex()}" 
             print(f"[WARN] No conversation_id from client; generated temporary: {conversation_id}")
         else:
             print(f"[INFO] Using conversation_id from client: {conversation_id}")
@@ -270,7 +292,6 @@ def chat_proxy_langchain():
         if not last_user_message_content: return jsonify({"error": "Empty user message content"}), 400
 
         current_turn_id = len(all_messages_from_request) 
-        # Store with user_id and conversation_id
         interaction_metadata = {"user_id": user_id, "conversation_id": conversation_id}
         add_interaction_to_db(user_id, conversation_id, current_turn_id, "user", last_user_message_content, interaction_metadata)
         user_doc_id = f"{user_id}_{conversation_id}_turn_{current_turn_id}_user" 
@@ -292,7 +313,6 @@ def chat_proxy_langchain():
         if chat_history_str != "No recent conversation history for this user in this session.":
              query_for_rag = f"Recent context for this user:\n{chat_history_str}\n\nUser's current question: {last_user_message_content}"
         
-        # Pass user_id for scoped RAG retrieval
         retrieved_long_term_interactions = retrieve_relevant_history(query_for_rag, user_id=user_id) 
 
         print(f"[INFO] LangChain Agent received query: '{last_user_message_content}' (User: {user_id}, ConvID: {conversation_id}, Model: {DEFAULT_MODEL}, Stream: {stream})")
@@ -346,7 +366,6 @@ def chat_proxy_langchain():
         else: # Non-streaming response
             response_payload = agent_executor.invoke(agent_input) 
             agent_final_answer = response_payload.get("output", "Sorry, I could not process your request effectively.")
-            # Store assistant response with user_id and conversation_id
             assistant_metadata = {"user_id": user_id, "conversation_id": conversation_id}
             add_interaction_to_db(user_id, conversation_id, current_turn_id + 1, "assistant", agent_final_answer, assistant_metadata)
             assistant_doc_id = f"{user_id}_{conversation_id}_turn_{current_turn_id + 1}_assistant"
