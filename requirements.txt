@@ -6,6 +6,7 @@ requests
 langchain
 langchain-community
 langchain-ollama
+langchain-huggingface
 ollama
 openai  # Optional: Required only if using OpenAI models
 
